@@ -13,6 +13,7 @@ docs/build
 dist
 logs/*
 outputs/*
+checkpoints/
 *.so
 .venv
 .docs-venv

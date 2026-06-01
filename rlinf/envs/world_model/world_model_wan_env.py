@@ -59,14 +59,23 @@ class WanEnv(BaseWorldEnv):
 
         # Model hyperparameters
         self.num_inference_steps = cfg.num_inference_steps
-        self.chunk = cfg.chunk  # Ta = 8
-        self.condition_frame_length = cfg.condition_frame_length  # To = 5
-        self.num_frames = cfg.num_frames  # Total number of frames to encode = 13
+        self.chunk = cfg.chunk
+        self.action_dim = cfg.get("action_dim", 7)
+        self.condition_frame_length = cfg.condition_frame_length
+        self.num_frames = cfg.num_frames
         assert self.num_frames == self.condition_frame_length + self.chunk, (
             "num_frames must be equal to condition_frame_length + action_chunk_length"
         )
 
         self.image_size = tuple(cfg.image_size)
+        self.image_layout = cfg.get("image_layout", "single")
+        if self.image_layout == "vertical_3view":
+            if self.image_size[0] % 3 != 0:
+                raise ValueError(
+                    f"vertical_3view requires image height divisible by 3, got {self.image_size}"
+                )
+        elif self.image_layout != "single":
+            raise ValueError(f"Unknown Wan image_layout: {self.image_layout}")
 
         #
         self.retain_action = cfg.get("retain_action", True)  # Default True
@@ -95,7 +104,7 @@ class WanEnv(BaseWorldEnv):
         self.condition_action = torch.zeros(
             self.num_envs,
             self.condition_frame_length,
-            7,
+            self.action_dim,
         )
 
         self.reset_gripper_open = cfg.get("reset_gripper_open", True)
@@ -340,7 +349,7 @@ class WanEnv(BaseWorldEnv):
             )  # [3, condition_frame_length, H, W]
 
             env_condition_action = np.zeros(
-                (self.condition_frame_length, 7), dtype=np.float32
+                (self.condition_frame_length, self.action_dim), dtype=np.float32
             )
 
             if self.reset_gripper_open and self.is_libero_env:
@@ -372,7 +381,9 @@ class WanEnv(BaseWorldEnv):
 
                     # keep first frame as reference frame, update the rest
                     env_img_tensor[:, target_idx + 1] = target_img
-                    env_condition_action[target_idx + 1] = target_frame["action"]
+                    env_condition_action[target_idx + 1] = self._fit_action_dim(
+                        target_frame["action"]
+                    )
 
             img_tensors.append(env_img_tensor)
             condition_actions.append(torch.from_numpy(env_condition_action))
@@ -402,26 +413,14 @@ class WanEnv(BaseWorldEnv):
         self._reset_metrics()
 
         # Initialize action buffer (if needed)
-        # But we'll keep it for compatibility
-        if hasattr(self.cfg, "action_dim"):
-            action_dim = self.cfg.action_dim
-        else:
-            action_dim = 7  # Default for LIBERO
-
         # Initialize with zeros or from init_ee_pose
         init_actions = []
         for init_ee_pose in init_ee_poses:
             if init_ee_pose is not None:
                 init_action = init_ee_pose.flatten()
-                # Pad or truncate to action_dim
-                if len(init_action) < action_dim:
-                    init_action = np.pad(
-                        init_action, (0, action_dim - len(init_action))
-                    )
-                elif len(init_action) > action_dim:
-                    init_action = init_action[:action_dim]
+                init_action = self._fit_action_dim(init_action)
             else:
-                init_action = np.zeros(action_dim, dtype=np.float32)
+                init_action = np.zeros(self.action_dim, dtype=np.float32)
             init_actions.append(init_action)
 
         # Store init_ee_poses
@@ -504,6 +503,15 @@ class WanEnv(BaseWorldEnv):
             if isinstance(actions, np.ndarray)
             else actions.to(self.device)
         )
+        if actions_tensor.shape[-1] != self.action_dim:
+            raise ValueError(
+                f"Expected action dim {self.action_dim}, got {actions_tensor.shape[-1]}"
+            )
+        if actions_tensor.shape[1] < self.chunk:
+            raise ValueError(
+                f"Expected at least {self.chunk} actions for Wan execution, got {actions_tensor.shape[1]}"
+            )
+        actions_tensor = actions_tensor[:, : self.chunk, :]
         self.condition_action = self.condition_action.to(
             device=actions_tensor.device, dtype=actions_tensor.dtype
         )
@@ -521,7 +529,7 @@ class WanEnv(BaseWorldEnv):
         B = num_envs
 
         batch_input_image = []
-        batch_input_image4 = []
+        batch_condition_images = []
 
         for env_idx in range(num_envs):
             # image_queue: [8, 3, 1, H, W]
@@ -534,16 +542,16 @@ class WanEnv(BaseWorldEnv):
                 imgs.append(Image.fromarray(img.astype(np.uint8)))
 
             batch_input_image.append(imgs[0])  # First frame
-            batch_input_image4.append(imgs[-4:])  # Last 4 frames
+            batch_condition_images.append(imgs[-(self.condition_frame_length - 1) :])
 
         kwargs = {
             "seed": 0,
             "tiled": False,
             "input_image": batch_input_image,  # List[PIL], len = B
-            "input_image4": batch_input_image4,  # List[List[PIL]], B×4
-            "action": actions_tensor,  # [B, T, A], T=13 or 8
-            "height": 256,
-            "width": 256,
+            "input_image4": batch_condition_images,
+            "action": actions_tensor,
+            "height": self.image_size[0],
+            "width": self.image_size[1],
             "num_frames": self.num_frames,
             "num_inference_steps": self.num_inference_steps,
             "cfg_scale": 1.0,
@@ -564,11 +572,18 @@ class WanEnv(BaseWorldEnv):
             video = torch.from_numpy(video)
             video = video.transpose(0, 1)  # [3, T, H, W]
 
-            # Update image_queue
-            for t in range(video.shape[1] - 4, video.shape[1]):
-                self.image_queue[env_idx][t - 8] = video[:, t : t + 1]
+            # Update image_queue with the latest condition frames.
+            start_t = max(0, video.shape[1] - self.condition_frame_length)
+            latest_frames = [
+                video[:, t_idx : t_idx + 1] for t_idx in range(start_t, video.shape[1])
+            ]
+            if len(latest_frames) < self.condition_frame_length:
+                latest_frames = [latest_frames[0]] * (
+                    self.condition_frame_length - len(latest_frames)
+                ) + latest_frames
+            self.image_queue[env_idx] = latest_frames[-self.condition_frame_length :]
 
-            all_samples.append(video[:, 5:])
+            all_samples.append(video[:, self.condition_frame_length :])
 
         # Stack all environments: [num_envs, C, T, H, W]
         x_samples = torch.stack(all_samples, dim=0).to(self.device)
@@ -608,7 +623,7 @@ class WanEnv(BaseWorldEnv):
         full_image = torch.clamp(full_image, 0, 255)
         # print(f'full_image:{full_image.shape}')
         # print(f'image_size:{self.image_size}')
-        # Resize to 256x256 to match libero_env format
+        # Resize to the configured world-model image size if needed.
         if full_image.shape[1:3] != self.image_size:
             # Reshape for interpolation: [num_envs, H, W, 3] -> [num_envs, 3, H, W]
             full_image = full_image.permute(0, 3, 1, 2)  # [num_envs, 3, H, W]
@@ -616,14 +631,24 @@ class WanEnv(BaseWorldEnv):
             full_image = F.interpolate(
                 full_image, size=self.image_size, mode="bilinear", align_corners=False
             )
-            # Convert back: [num_envs, 3, 256, 256] -> [num_envs, 256, 256, 3]
-            full_image = full_image.permute(0, 2, 3, 1)  # [num_envs, 256, 256, 3]
+            full_image = full_image.permute(0, 2, 3, 1)
 
         # Convert to uint8 tensor (keep as tensor, not numpy)
         full_image = full_image.to(torch.uint8)
 
-        # Get states (dummy for now, can be extended)
-        states = torch.zeros((num_envs, 16), device=self.device, dtype=torch.float32)
+        if self.image_layout == "vertical_3view":
+            view_h = full_image.shape[1] // 3
+            main_image = full_image[:, :view_h, :, :]
+            left_wrist = full_image[:, view_h : 2 * view_h, :, :]
+            right_wrist = full_image[:, 2 * view_h : 3 * view_h, :, :]
+            wrist_images = torch.stack([left_wrist, right_wrist], dim=1)
+        else:
+            main_image = full_image
+            wrist_images = None
+
+        states = torch.zeros(
+            (num_envs, self.action_dim), device=self.device, dtype=torch.float32
+        )
 
         # Get task descriptions
         if hasattr(self, "task_descriptions"):
@@ -633,13 +658,21 @@ class WanEnv(BaseWorldEnv):
 
         # Wrap observation - format aligned with libero_env
         obs = {
-            "main_images": full_image,  # [num_envs, H, W, 3]
-            "wrist_images": None,  # Not available in world model
-            "states": states,  # [num_envs, 16]
+            "main_images": main_image,
+            "wrist_images": wrist_images,
+            "states": states,
             "task_descriptions": task_descriptions,  # list of strings
         }
 
         return obs
+
+    def _fit_action_dim(self, action):
+        action = np.asarray(action, dtype=np.float32).reshape(-1)
+        if action.shape[0] < self.action_dim:
+            action = np.pad(action, (0, self.action_dim - action.shape[0]))
+        elif action.shape[0] > self.action_dim:
+            action = action[: self.action_dim]
+        return action
 
     def _handle_auto_reset(self, dones, extracted_obs, infos):
         """Handle automatic reset on episode termination"""
@@ -659,7 +692,7 @@ class WanEnv(BaseWorldEnv):
     @torch.no_grad()
     def chunk_step(self, policy_output_action):
         """Execute a chunk of actions - optimized version that processes chunk actions together"""
-        # chunk_actions: [num_envs, chunk_steps, action_dim=8]
+        # chunk_actions: [num_envs, chunk_steps, action_dim]
         self.onload()
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             self._infer_next_chunk_frames(policy_output_action)
@@ -834,7 +867,7 @@ if __name__ == "__main__":
     num_envs = cfg.total_num_envs
 
     chunk_traj = 1
-    zeros_actions = np.zeros((num_envs, chunk_steps, 7))
+    zeros_actions = np.zeros((num_envs, chunk_steps, cfg.get("action_dim", 7)))
 
     for i in range(chunk_traj):
         print(f"Chunk {i} of {chunk_traj}")

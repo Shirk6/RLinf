@@ -649,8 +649,12 @@ def convert_pi0_checkpoint(
         pi0_model, os.path.join(output_path, "model.safetensors")
     )
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    # Copy assets folder if it exists. OpenPI checkpoints may store assets either
+    # inside the step directory or next to it, depending on how they were saved.
+    checkpoint_path = pathlib.Path(checkpoint_dir)
+    assets_source = checkpoint_path / "assets"
+    if not assets_source.exists():
+        assets_source = checkpoint_path.parent / "assets"
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
@@ -688,7 +692,17 @@ def main(
         precision: Precision for model conversion
         inspect_only: Only inspect parameter keys, don't convert
     """
-    model_config = _config.get_config(config_name).model
+    try:
+        model_config = _config.get_config(config_name).model
+    except ValueError:
+        if config_name == "pi05_yam_tower":
+            model_config = openpi.models.pi0_config.Pi0Config(
+                pi05=True, discrete_state_input=True
+            )
+        else:
+            from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+            model_config = get_openpi_config(config_name).model
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
         raise ValueError(f"Config {config_name} is not a Pi0Config")
     if inspect_only:

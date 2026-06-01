@@ -1,0 +1,51 @@
+env_type: wan_wm
+task_suite_name: tower_of_hanoi_game
+wm_env_type: yam
+
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+max_steps_per_rollout_epoch: 250
+max_episode_steps: 250
+
+use_rel_reward: True
+reward_coef: 1.0
+
+reset_gripper_open: False
+is_eval: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: True
+use_ordered_reset_state_ids: False
+specific_reset_id: null
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: True
+
+###  ------------------Wan params define here ------------------
+
+wan_wm_hf_ckpt_path: null
+
+VAE_path: ${env.train.wan_wm_hf_ckpt_path}/Wan2.2_VAE.pth
+model_path: ${env.train.wan_wm_hf_ckpt_path}/model-00001.safetensors
+
+enable_kir: True
+initial_image_path: ${env.train.wan_wm_hf_ckpt_path}/dataset/
+
+num_inference_steps: 5
+action_dim: 14
+chunk: 48
+condition_frame_length: 9
+image_size: [540, 320]
+image_layout: vertical_3view
+num_frames: 57
+
+reward_model:
+  type: ResnetRewModel
+  from_pretrained: ${env.train.wan_wm_hf_ckpt_path}/resnet_rm.pth

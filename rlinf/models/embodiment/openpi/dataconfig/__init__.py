@@ -62,6 +62,7 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.yam_dataconfig import DualYamDataConfig
 
 _CONFIGS = [
     TrainConfig(
@@ -306,6 +307,22 @@ _CONFIGS = [
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
         num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_tower",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=DualYamDataConfig(
+            repo_id="tower-of-hanoi-game/expert-data",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="tower-of-hanoi-game/weighted-bc"),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_yam_tower_160000",
+        num_train_steps=200_000,
     ),
     TrainConfig(
         name="pi0_behavior",

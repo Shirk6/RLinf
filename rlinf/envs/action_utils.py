@@ -236,6 +236,8 @@ def prepare_actions(
                 raw_chunk_actions=raw_chunk_actions,
                 model_type=model_type,
             )
+        elif wm_env_type in ["yam"]:
+            chunk_actions = raw_chunk_actions
         else:
             raise NotImplementedError(f"Env type {wm_env_type} not implemented")
     elif env_type == SupportedEnvType.MANISKILL:

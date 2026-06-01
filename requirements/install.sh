@@ -1135,6 +1135,14 @@ install_openpi_model() {
             install_flash_attn
             install_robotwin_env
             ;;
+        wan)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_maniskill_libero_env
+            install_wan_world_model
+            uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
+            install_flash_attn
+            ;;
         isaaclab)
             create_and_sync_venv
             install_common_embodied_deps

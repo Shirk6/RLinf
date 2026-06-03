@@ -39,7 +39,7 @@ runner:
 algorithm:
   normalize_advantages: True
   kl_penalty: kl
-  group_size: 4
+  group_size: 8
   reward_coef: 1.0
   rollout_epoch: 8
   eval_rollout_epoch: 1
@@ -69,7 +69,7 @@ algorithm:
 
   sampling_params:
     do_sample: True
-    temperature_train: 1.0
+    temperature_train: 1.6
     temperature_eval: 0.6
     top_k: 50
     top_p: 1.0
@@ -85,14 +85,16 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 4
+    total_num_envs: 64
     group_size: ${algorithm.group_size}
-    max_episode_steps: 250
-    max_steps_per_rollout_epoch: 240
+    max_episode_steps: 4080
+    max_steps_per_rollout_epoch: 4080
     reward_coef: ${algorithm.reward_coef}
     wan_wm_hf_ckpt_path: "/path/to/RLinf-Wan-Tower"
     enable_offload: True
     num_inference_steps: 5
+    video_cfg:
+      save_video: False
   eval:
     total_num_envs: 4
     auto_reset: True
@@ -123,8 +125,8 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 8
-  global_batch_size: 128
+  micro_batch_size: 32
+  global_batch_size: 8704
   seed: 42
   enable_offload: True
 

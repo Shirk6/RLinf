@@ -32,11 +32,15 @@ class ManagerProxy:
         self._manager_cls = manager_cls
 
         if not ray.is_initialized():
-            ray.init(
-                address="auto",
-                namespace=Cluster.NAMESPACE,
-                logging_level=Cluster.LOGGING_LEVEL,
-            )
+            ray_init_kwargs = {
+                "address": "auto",
+                "namespace": Cluster.NAMESPACE,
+                "logging_level": Cluster.LOGGING_LEVEL,
+            }
+            ray_temp_dir = Cluster.get_ray_temp_dir()
+            if ray_temp_dir is not None:
+                ray_init_kwargs["_temp_dir"] = ray_temp_dir
+            ray.init(**ray_init_kwargs)
 
         self._manager = self._wait_for_manager_actor(no_wait=no_wait)
 

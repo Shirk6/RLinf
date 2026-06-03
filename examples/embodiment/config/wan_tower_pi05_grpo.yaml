@@ -88,7 +88,7 @@ env:
     total_num_envs: 4
     group_size: ${algorithm.group_size}
     max_episode_steps: 250
-    max_steps_per_rollout_epoch: 250
+    max_steps_per_rollout_epoch: 240
     reward_coef: ${algorithm.reward_coef}
     wan_wm_hf_ckpt_path: "/path/to/RLinf-Wan-Tower"
     enable_offload: True
@@ -98,7 +98,7 @@ env:
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 250
-    max_steps_per_rollout_epoch: 250
+    max_steps_per_rollout_epoch: 240
     group_size: 1
     reward_coef: ${algorithm.reward_coef}
     wan_wm_hf_ckpt_path: ${env.train.wan_wm_hf_ckpt_path}
@@ -131,7 +131,7 @@ actor:
   model:
     model_path: "/project/peilab/srk/rss_2026_ws/RLinf/checkpoints/torch/pi05_yam_tower_160000"
     model_type: "openpi"
-    num_action_chunks: 50
+    num_action_chunks: 48
     action_dim: 14
     add_value_head: False
     openpi:

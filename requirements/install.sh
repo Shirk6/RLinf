@@ -1764,7 +1764,7 @@ install_opensora_world_model() {
 
 install_wan_world_model() {
     local wan_dir
-    wan_dir=$(clone_or_reuse_repo WAN_PATH "$VENV_DIR/wan" https://github.com/RLinf/diffsynth-studio.git)
+    wan_dir=$(clone_or_reuse_repo WAN_PATH "$VENV_DIR/wan" ${GITHUB_PREFIX}https://github.com/Shirk6/diffsynth-studio-rlinf.git)
     uv pip install -e "$wan_dir"
     uv pip install -r $SCRIPT_DIR/embodied/models/wan.txt
 }

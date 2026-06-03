@@ -69,10 +69,22 @@ class WanEnv(BaseWorldEnv):
 
         self.image_size = tuple(cfg.image_size)
         self.image_layout = cfg.get("image_layout", "single")
+        self.view_height = cfg.get("view_height", 180)
+        self.num_views = cfg.get("num_views", 3)
+        self.padding_bottom = cfg.get("padding_bottom", 0)
         if self.image_layout == "vertical_3view":
             if self.image_size[0] % 3 != 0:
                 raise ValueError(
                     f"vertical_3view requires image height divisible by 3, got {self.image_size}"
+                )
+        elif self.image_layout == "vertical_3view_padded_bottom":
+            valid_height = self.view_height * self.num_views
+            expected_height = valid_height + self.padding_bottom
+            if self.image_size[0] != expected_height:
+                raise ValueError(
+                    "vertical_3view_padded_bottom requires image height "
+                    f"{expected_height} (= {self.num_views} * {self.view_height} + "
+                    f"{self.padding_bottom}), got {self.image_size}"
                 )
         elif self.image_layout != "single":
             raise ValueError(f"Unknown Wan image_layout: {self.image_layout}")
@@ -92,9 +104,12 @@ class WanEnv(BaseWorldEnv):
         self.current_obs = None
         self.task_descriptions = [""] * self.num_envs
         self.init_ee_poses = [None] * self.num_envs
+        self.state_proxy = torch.zeros(
+            self.num_envs, self.action_dim, device=self.device, dtype=torch.float32
+        )
 
-        # Image queue for condition frames to generate video,
-        # keep length of condition_frame_length
+        # Image queue for condition frames to generate video. The first frame
+        # is the reset reference frame and remains fixed during autoregressive rollout.
         self.image_queue = [
             [None] * self.condition_frame_length for _ in range(self.num_envs)
         ]
@@ -426,6 +441,9 @@ class WanEnv(BaseWorldEnv):
         # Store init_ee_poses
         self.task_descriptions = task_descriptions
         self.init_ee_poses = init_ee_poses
+        self.state_proxy = torch.as_tensor(
+            np.stack(init_actions), device=self.device, dtype=torch.float32
+        )
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
@@ -458,6 +476,7 @@ class WanEnv(BaseWorldEnv):
             extract_chunk_obs = extract_chunk_obs.squeeze(
                 2
             )  # [num_envs * chunk, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
             rewards = self.reward_model.predict_rew(extract_chunk_obs)
@@ -472,6 +491,7 @@ class WanEnv(BaseWorldEnv):
             extract_chunk_obs = extract_chunk_obs.squeeze(
                 2
             )  # [num_envs * chunk, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
             # Prepare instructions for each frame in the chunk
@@ -489,6 +509,20 @@ class WanEnv(BaseWorldEnv):
             raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
 
         return rewards
+
+    def _select_reward_model_view(self, obs):
+        """Use only the main camera region for reward model inference."""
+        if self.image_layout == "vertical_3view_padded_bottom":
+            if obs.shape[-2] < self.view_height:
+                raise ValueError(
+                    f"Cannot crop main view from reward input height {obs.shape[-2]}; "
+                    f"need at least {self.view_height}"
+                )
+            return obs[:, :, : self.view_height, :]
+        if self.image_layout == "vertical_3view":
+            view_height = obs.shape[-2] // self.num_views
+            return obs[:, :, :view_height, :]
+        return obs
 
     def _infer_next_chunk_frames(self, actions):
         """Predict next frame chunk using the wan model"""
@@ -532,7 +566,8 @@ class WanEnv(BaseWorldEnv):
         batch_condition_images = []
 
         for env_idx in range(num_envs):
-            # image_queue: [8, 3, 1, H, W]
+            # image_queue[0] is the fixed reset reference frame. The remaining
+            # frames are autoregressive condition frames from the previous chunk.
             imgs = []
             for frame in self.image_queue[env_idx]:
                 frame = frame[:, 0].cpu().numpy()  # [3, H, W]
@@ -542,7 +577,7 @@ class WanEnv(BaseWorldEnv):
                 imgs.append(Image.fromarray(img.astype(np.uint8)))
 
             batch_input_image.append(imgs[0])  # First frame
-            batch_condition_images.append(imgs[-(self.condition_frame_length - 1) :])
+            batch_condition_images.append(imgs[1 : self.condition_frame_length])
 
         kwargs = {
             "seed": 0,
@@ -572,16 +607,22 @@ class WanEnv(BaseWorldEnv):
             video = torch.from_numpy(video)
             video = video.transpose(0, 1)  # [3, T, H, W]
 
-            # Update image_queue with the latest condition frames.
-            start_t = max(0, video.shape[1] - self.condition_frame_length)
+            # Keep image_queue[0] as the reset reference frame and update only
+            # the autoregressive condition frames with the latest generated frames.
+            reference_frame = self.image_queue[env_idx][0]
+            num_autoreg_frames = self.condition_frame_length - 1
+            start_t = max(0, video.shape[1] - num_autoreg_frames)
             latest_frames = [
                 video[:, t_idx : t_idx + 1] for t_idx in range(start_t, video.shape[1])
             ]
-            if len(latest_frames) < self.condition_frame_length:
+            if len(latest_frames) < num_autoreg_frames:
                 latest_frames = [latest_frames[0]] * (
-                    self.condition_frame_length - len(latest_frames)
+                    num_autoreg_frames - len(latest_frames)
                 ) + latest_frames
-            self.image_queue[env_idx] = latest_frames[-self.condition_frame_length :]
+            self.image_queue[env_idx] = [
+                reference_frame,
+                *latest_frames[-num_autoreg_frames:],
+            ]
 
             all_samples.append(video[:, self.condition_frame_length :])
 
@@ -636,9 +677,20 @@ class WanEnv(BaseWorldEnv):
         # Convert to uint8 tensor (keep as tensor, not numpy)
         full_image = full_image.to(torch.uint8)
 
-        if self.image_layout == "vertical_3view":
-            view_h = full_image.shape[1] // 3
-            main_image = full_image[:, :view_h, :, :]
+        if self.image_layout in {"vertical_3view", "vertical_3view_padded_bottom"}:
+            if self.image_layout == "vertical_3view_padded_bottom":
+                valid_height = self.view_height * self.num_views
+                if full_image.shape[1] < valid_height:
+                    raise ValueError(
+                        f"Cannot split padded 3-view image with height {full_image.shape[1]}; "
+                        f"need at least {valid_height}"
+                    )
+                full_image = full_image[:, :valid_height, :, :]
+                view_h = self.view_height
+            else:
+                view_h = full_image.shape[1] // 3
+
+            main_image = full_image[:, 0:view_h, :, :]
             left_wrist = full_image[:, view_h : 2 * view_h, :, :]
             right_wrist = full_image[:, 2 * view_h : 3 * view_h, :, :]
             wrist_images = torch.stack([left_wrist, right_wrist], dim=1)
@@ -646,9 +698,11 @@ class WanEnv(BaseWorldEnv):
             main_image = full_image
             wrist_images = None
 
-        states = torch.zeros(
-            (num_envs, self.action_dim), device=self.device, dtype=torch.float32
-        )
+        states = self.state_proxy.to(device=self.device, dtype=torch.float32)
+        if states.shape != (num_envs, self.action_dim):
+            raise ValueError(
+                f"Unexpected state_proxy shape {states.shape}, expected {(num_envs, self.action_dim)}"
+            )
 
         # Get task descriptions
         if hasattr(self, "task_descriptions"):
@@ -696,6 +750,19 @@ class WanEnv(BaseWorldEnv):
         self.onload()
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
             self._infer_next_chunk_frames(policy_output_action)
+
+        chunk_actions = (
+            torch.from_numpy(policy_output_action).to(self.device)
+            if isinstance(policy_output_action, np.ndarray)
+            else policy_output_action.to(self.device)
+        )
+        if chunk_actions.shape[1] < 6:
+            raise ValueError(
+                f"Need at least 6 actions per chunk to build state proxy, got {chunk_actions.shape[1]}"
+            )
+        self.state_proxy = chunk_actions[:, -6, : self.action_dim].detach().to(
+            device=self.device, dtype=torch.float32
+        )
 
         # Update elapsed steps (incremented after inference)
         # print(f'elapsed_steps:{self.elapsed_steps}')
@@ -774,6 +841,7 @@ class WanEnv(BaseWorldEnv):
         self.pipe.dit = self.pipe.dit.to("cpu")
         self.reward_model = self.reward_model.to("cpu")
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
+        self.state_proxy = self.state_proxy.cpu()
         self.prev_step_reward = self.prev_step_reward.cpu()
         self.reset_state_ids = self.reset_state_ids.cpu()
         if self.record_metrics:
@@ -790,6 +858,7 @@ class WanEnv(BaseWorldEnv):
         self.pipe.vae = self.pipe.vae.to(self.device)
         self.reward_model = self.reward_model.to(self.device)
         self.current_obs = recursive_to_device(self.current_obs, self.device)
+        self.state_proxy = self.state_proxy.to(self.device)
         self.prev_step_reward = self.prev_step_reward.to(self.device)
         self.reset_state_ids = self.reset_state_ids.to(self.device)
         if self.record_metrics:
@@ -805,6 +874,7 @@ class WanEnv(BaseWorldEnv):
             else None,
             "task_descriptions": self.task_descriptions,
             "init_ee_poses": self.init_ee_poses,
+            "state_proxy": self.state_proxy.cpu(),
             "elapsed_steps": self.elapsed_steps,
             "prev_step_reward": self.prev_step_reward.cpu(),
             "_is_start": self._is_start,

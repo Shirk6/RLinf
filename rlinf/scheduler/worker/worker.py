@@ -432,11 +432,15 @@ class Worker(metaclass=WorkerMeta):
 
         # Initialize Ray if not already initialized
         if not ray.is_initialized():
-            ray.init(
-                address="auto",
-                namespace=Cluster.NAMESPACE,
-                logging_level=Cluster.LOGGING_LEVEL,
-            )
+            ray_init_kwargs = {
+                "address": "auto",
+                "namespace": Cluster.NAMESPACE,
+                "logging_level": Cluster.LOGGING_LEVEL,
+            }
+            ray_temp_dir = Cluster.get_ray_temp_dir()
+            if ray_temp_dir is not None:
+                ray_init_kwargs["_temp_dir"] = ray_temp_dir
+            ray.init(**ray_init_kwargs)
 
         if self._is_ray_actor and parent_address is not None:
             # The Worker is a Ray actor launched inside a Worker

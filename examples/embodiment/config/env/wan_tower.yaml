@@ -42,8 +42,11 @@ num_inference_steps: 5
 action_dim: 14
 chunk: 48
 condition_frame_length: 9
-image_size: [540, 320]
-image_layout: vertical_3view
+image_size: [544, 320]
+image_layout: vertical_3view_padded_bottom
+view_height: 180
+num_views: 3
+padding_bottom: 4
 num_frames: 57
 
 reward_model:

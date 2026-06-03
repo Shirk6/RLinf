@@ -149,6 +149,15 @@ class Cluster:
             return s.getsockname()[1]
 
     @classmethod
+    def get_ray_temp_dir(cls) -> Optional[str]:
+        """Return a job-local Ray temp dir when configured."""
+        ray_tmp_dir = os.environ.get("RAY_TMPDIR") or os.environ.get("RAY_TMP_DIR")
+        if ray_tmp_dir:
+            Path(ray_tmp_dir).mkdir(parents=True, exist_ok=True)
+            return ray_tmp_dir
+        return None
+
+    @classmethod
     def has_initialized(cls):
         """Check if the cluster has been initialized."""
         return hasattr(cls, "_instance") and cls._instance is not None
@@ -326,6 +335,9 @@ class Cluster:
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
             }
+            ray_temp_dir = Cluster.get_ray_temp_dir()
+            if ray_temp_dir is not None:
+                ray_init_kwargs["_temp_dir"] = ray_temp_dir
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
                 py_mods = ray_init_kwargs["runtime_env"].get("py_modules") or ()
@@ -342,6 +354,9 @@ class Cluster:
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
             }
+            ray_temp_dir = Cluster.get_ray_temp_dir()
+            if ray_temp_dir is not None:
+                ray_init_kwargs["_temp_dir"] = ray_temp_dir
             if self._ray_code_sync_fragment is not None:
                 ray_init_kwargs["runtime_env"] = dict(self._ray_code_sync_fragment)
             ray.init(**ray_init_kwargs)
@@ -448,11 +463,15 @@ class Cluster:
 
     def _init_from_existing_managers(self):
         if not ray.is_initialized():
-            ray.init(
-                address="auto",
-                namespace=Cluster.NAMESPACE,
-                logging_level=Cluster.LOGGING_LEVEL,
-            )
+            ray_init_kwargs: dict[str, Any] = {
+                "address": "auto",
+                "namespace": Cluster.NAMESPACE,
+                "logging_level": Cluster.LOGGING_LEVEL,
+            }
+            ray_temp_dir = Cluster.get_ray_temp_dir()
+            if ray_temp_dir is not None:
+                ray_init_kwargs["_temp_dir"] = ray_temp_dir
+            ray.init(**ray_init_kwargs)
 
         from ..manager.node_manager import NodeManager
 

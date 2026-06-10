@@ -23,11 +23,13 @@ import torch.nn.functional as F
 import torchvision.transforms as transforms
 from diffsynth.models.reward_model import ResnetRewModel, TaskEmbedResnetRewModel
 from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
+from omegaconf import OmegaConf
 from PIL import Image
 
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.models.embodiment.reward.resnet_reward_model import ResNetRewardModel
 
 __all__ = ["WanEnv"]
 
@@ -63,9 +65,27 @@ class WanEnv(BaseWorldEnv):
         self.action_dim = cfg.get("action_dim", 7)
         self.condition_frame_length = cfg.condition_frame_length
         self.num_frames = cfg.num_frames
-        assert self.num_frames == self.condition_frame_length + self.chunk, (
-            "num_frames must be equal to condition_frame_length + action_chunk_length"
+        self.wan_predict_frames = cfg.get(
+            "wan_predict_frames", self.num_frames - self.condition_frame_length
         )
+        self.action_downsample_stride = cfg.get("action_downsample_stride", 1)
+        assert self.num_frames == self.condition_frame_length + self.wan_predict_frames, (
+            "num_frames must be equal to condition_frame_length + wan_predict_frames"
+        )
+        if self.wan_predict_frames <= 0:
+            raise ValueError(
+                f"wan_predict_frames must be positive, got {self.wan_predict_frames}"
+            )
+        if self.action_downsample_stride <= 0:
+            raise ValueError(
+                "action_downsample_stride must be positive, "
+                f"got {self.action_downsample_stride}"
+            )
+        if self.action_downsample_stride * self.wan_predict_frames > self.chunk:
+            raise ValueError(
+                "action_downsample_stride * wan_predict_frames must fit within chunk: "
+                f"{self.action_downsample_stride} * {self.wan_predict_frames} > {self.chunk}"
+            )
 
         self.image_size = tuple(cfg.image_size)
         self.image_layout = cfg.get("image_layout", "single")
@@ -92,6 +112,7 @@ class WanEnv(BaseWorldEnv):
         #
         self.retain_action = cfg.get("retain_action", True)  # Default True
         self.enable_kir = cfg.get("enable_kir", True)
+        self.use_latent_condition_cache = cfg.get("use_latent_condition_cache", True)
 
         # load pipeline
         self.pipe = self._build_pipeline()
@@ -102,6 +123,7 @@ class WanEnv(BaseWorldEnv):
         # Initialize state
         # Will be a tensor [num_envs, 3, 1, T, h, w]
         self.current_obs = None
+        self.condition_latents = None
         self.task_descriptions = [""] * self.num_envs
         self.init_ee_poses = [None] * self.num_envs
         self.state_proxy = torch.zeros(
@@ -162,6 +184,12 @@ class WanEnv(BaseWorldEnv):
     def _load_reward_model(self):
         if self.cfg.reward_model.type == "ResnetRewModel":
             rew_model = ResnetRewModel(self.cfg.reward_model.from_pretrained)
+        elif self.cfg.reward_model.type == "ResNetRewardModel":
+            reward_model_cfg = OmegaConf.create(
+                OmegaConf.to_container(self.cfg.reward_model, resolve=True)
+            )
+            reward_model_cfg.model_path = self.cfg.reward_model.from_pretrained
+            rew_model = ResNetRewardModel(reward_model_cfg)
         elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
             rew_model = TaskEmbedResnetRewModel(
                 checkpoint_path=self.cfg.reward_model.from_pretrained,
@@ -248,6 +276,30 @@ class WanEnv(BaseWorldEnv):
         success_estimated = max_reward_in_chunk >= success_threshold
 
         return success_estimated.to(self.device)
+
+    def _downsample_actions_for_wan(self, chunk_actions):
+        action_indices = (
+            torch.arange(
+                self.wan_predict_frames,
+                device=chunk_actions.device,
+                dtype=torch.long,
+            )
+            * self.action_downsample_stride
+            + (self.action_downsample_stride - 1)
+        )
+        return chunk_actions.index_select(dim=1, index=action_indices)
+
+    def _expand_wan_rewards_to_chunk(self, wan_rewards):
+        if wan_rewards.shape != (self.num_envs, self.wan_predict_frames):
+            raise ValueError(
+                "Unexpected Wan reward shape "
+                f"{wan_rewards.shape}; expected {(self.num_envs, self.wan_predict_frames)}"
+            )
+        expanded = wan_rewards.repeat_interleave(self.action_downsample_stride, dim=1)
+        if expanded.shape[1] < self.chunk:
+            pad = expanded[:, -1:].expand(-1, self.chunk - expanded.shape[1])
+            expanded = torch.cat([expanded, pad], dim=1)
+        return expanded[:, : self.chunk]
 
     def update_reset_state_ids(self):
         """Updates the reset state IDs for environment initialization."""
@@ -424,6 +476,7 @@ class WanEnv(BaseWorldEnv):
                 for t_idx in range(self.condition_frame_length)
             ]
             self.image_queue[env_idx] = frames
+        self.condition_latents = None
 
         self._reset_metrics()
 
@@ -468,29 +521,49 @@ class WanEnv(BaseWorldEnv):
 
         if self.cfg.reward_model.type == "ResnetRewModel":
             extract_chunk_obs = extract_chunk_obs[
-                :, -self.chunk :, :, :, :, :
-            ]  # [num_envs, chunk, 3, v, h, w]
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
             extract_chunk_obs = extract_chunk_obs.reshape(
-                self.num_envs * self.chunk, 3, v, h, w
+                self.num_envs * self.wan_predict_frames, 3, v, h, w
             )
             extract_chunk_obs = extract_chunk_obs.squeeze(
                 2
-            )  # [num_envs * chunk, 3, h, w]
+            )  # [num_envs * wan_predict_frames, 3, h, w]
             extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
             rewards = self.reward_model.predict_rew(extract_chunk_obs)
-            rewards = rewards.reshape(self.num_envs, self.chunk)
-        elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
+            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
+            rewards = self._expand_wan_rewards_to_chunk(rewards)
+        elif self.cfg.reward_model.type == "ResNetRewardModel":
             extract_chunk_obs = extract_chunk_obs[
-                :, -self.chunk :, :, :, :, :
-            ]  # [num_envs, chunk, 3, v, h, w]
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
             extract_chunk_obs = extract_chunk_obs.reshape(
-                self.num_envs * self.chunk, 3, v, h, w
+                self.num_envs * self.wan_predict_frames, 3, v, h, w
             )
             extract_chunk_obs = extract_chunk_obs.squeeze(
                 2
-            )  # [num_envs * chunk, 3, h, w]
+            )  # [num_envs * wan_predict_frames, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
+            extract_chunk_obs = extract_chunk_obs.to(self.device)
+            extract_chunk_obs = (extract_chunk_obs.clamp(-1.0, 1.0) + 1.0) / 2.0
+
+            rewards = self.reward_model.compute_reward(
+                {"main_images": extract_chunk_obs}
+            )
+            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
+            rewards = self._expand_wan_rewards_to_chunk(rewards)
+        elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
+            extract_chunk_obs = extract_chunk_obs[
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
+            extract_chunk_obs = extract_chunk_obs.reshape(
+                self.num_envs * self.wan_predict_frames, 3, v, h, w
+            )
+            extract_chunk_obs = extract_chunk_obs.squeeze(
+                2
+            )  # [num_envs * wan_predict_frames, 3, h, w]
             extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
@@ -499,30 +572,102 @@ class WanEnv(BaseWorldEnv):
             instructions = []
             for env_idx in range(self.num_envs):
                 task_desc = self.task_descriptions[env_idx]
-                # Repeat the instruction for each frame in the chunk
-                instructions.extend([task_desc] * self.chunk)
+                instructions.extend([task_desc] * self.wan_predict_frames)
 
             # Predict rewards with instruction conditioning
             rewards = self.reward_model.predict_rew(extract_chunk_obs, instructions)
-            rewards = rewards.reshape(self.num_envs, self.chunk)
+            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
+            rewards = self._expand_wan_rewards_to_chunk(rewards)
         else:
             raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
 
         return rewards
 
     def _select_reward_model_view(self, obs):
-        """Use only the main camera region for reward model inference."""
+        """Prepare full-frame reward model input while removing only bottom padding."""
         if self.image_layout == "vertical_3view_padded_bottom":
-            if obs.shape[-2] < self.view_height:
+            valid_height = self.view_height * self.num_views
+            if obs.shape[-2] < valid_height:
                 raise ValueError(
-                    f"Cannot crop main view from reward input height {obs.shape[-2]}; "
-                    f"need at least {self.view_height}"
+                    f"Cannot remove bottom padding from reward input height {obs.shape[-2]}; "
+                    f"need at least {valid_height}"
                 )
-            return obs[:, :, : self.view_height, :]
-        if self.image_layout == "vertical_3view":
-            view_height = obs.shape[-2] // self.num_views
-            return obs[:, :, :view_height, :]
-        return obs
+            obs = obs[:, :, :valid_height, :]
+        return self._resize_reward_model_input(obs)
+
+    def _resize_reward_model_input(self, obs):
+        """Optionally resize reward model input while preserving BCHW layout."""
+        if obs.ndim != 4:
+            raise ValueError(
+                "Reward model input must be BCHW before resize, "
+                f"got shape {tuple(obs.shape)}"
+            )
+        if obs.shape[1] != 3:
+            raise ValueError(
+                "Reward model input must be channel-first with 3 channels, "
+                f"got shape {tuple(obs.shape)}"
+            )
+
+        resize_cfg = self.cfg.reward_model.get("resize", {})
+        if not resize_cfg or not resize_cfg.get("enabled", False):
+            return obs
+
+        size = resize_cfg.get("size", None)
+        if size is None or len(size) != 2:
+            raise ValueError(
+                "reward_model.resize.size must be [height, width] when resize is enabled"
+            )
+        target_size = (int(size[0]), int(size[1]))
+        if tuple(obs.shape[-2:]) == target_size:
+            return obs
+
+        mode = resize_cfg.get("mode", "bilinear")
+        interpolate_kwargs = {"size": target_size, "mode": mode}
+        if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            interpolate_kwargs["align_corners"] = resize_cfg.get(
+                "align_corners", False
+            )
+        return F.interpolate(obs, **interpolate_kwargs)
+
+    def _image_queue_frame_to_pil(self, frame):
+        frame = frame[:, 0].detach().cpu().numpy()  # [3, H, W]
+        img = np.transpose(frame, (1, 2, 0))
+        if img.max() <= 1.2:
+            img = ((img + 1.0) / 2.0 * 255.0).clip(0, 255)
+        return Image.fromarray(img.astype(np.uint8))
+
+    def _build_wan_condition_images(self):
+        batch_input_image = []
+        batch_condition_images = []
+
+        for env_idx in range(self.num_envs):
+            # image_queue[0] is the fixed reset reference frame. The remaining
+            # frames are autoregressive condition frames from the previous chunk.
+            imgs = [
+                self._image_queue_frame_to_pil(frame)
+                for frame in self.image_queue[env_idx]
+            ]
+            batch_input_image.append(imgs[0])
+            batch_condition_images.append(imgs[1 : self.condition_frame_length])
+
+        return batch_input_image, batch_condition_images
+
+    def _encode_condition_latents(self, batch_input_image, batch_condition_images):
+        self.pipe.load_models_to_device(["vae"])
+        condition_images = [
+            [img] + img4 for img, img4 in zip(batch_input_image, batch_condition_images)
+        ]
+        condition_video = self.pipe.preprocess_video(
+            [
+                [frame.resize((self.image_size[1], self.image_size[0])) for frame in frames]
+                for frames in condition_images
+            ]
+        )
+        return self.pipe.vae.encode(
+            condition_video,
+            device=self.pipe.device,
+            tiled=False,
+        ).to(dtype=self.pipe.torch_dtype, device=self.pipe.device)
 
     def _infer_next_chunk_frames(self, actions):
         """Predict next frame chunk using the wan model"""
@@ -549,9 +694,16 @@ class WanEnv(BaseWorldEnv):
         self.condition_action = self.condition_action.to(
             device=actions_tensor.device, dtype=actions_tensor.dtype
         )
+        self.condition_action[:, 0, :] = 0
+        self.condition_action[:, 0, -1] = -1
 
         if self.retain_action:
-            actions_tensor = torch.cat([self.condition_action, actions_tensor], dim=1)
+            downsampled_actions = self._downsample_actions_for_wan(actions_tensor)
+            actions_tensor = torch.cat(
+                [self.condition_action, downsampled_actions], dim=1
+            )
+        else:
+            actions_tensor = self._downsample_actions_for_wan(actions_tensor)
 
         self.condition_action[:, 1 : self.condition_frame_length, :] = actions_tensor[
             :, -(self.condition_frame_length - 1) :, :
@@ -562,28 +714,22 @@ class WanEnv(BaseWorldEnv):
 
         B = num_envs
 
-        batch_input_image = []
-        batch_condition_images = []
+        batch_input_image, batch_condition_images = self._build_wan_condition_images()
 
-        for env_idx in range(num_envs):
-            # image_queue[0] is the fixed reset reference frame. The remaining
-            # frames are autoregressive condition frames from the previous chunk.
-            imgs = []
-            for frame in self.image_queue[env_idx]:
-                frame = frame[:, 0].cpu().numpy()  # [3, H, W]
-                img = np.transpose(frame, (1, 2, 0))
-                if img.max() <= 1.2:
-                    img = ((img + 1.0) / 2.0 * 255.0).clip(0, 255)
-                imgs.append(Image.fromarray(img.astype(np.uint8)))
-
-            batch_input_image.append(imgs[0])  # First frame
-            batch_condition_images.append(imgs[1 : self.condition_frame_length])
+        condition_latents = None
+        if self.use_latent_condition_cache:
+            if self.condition_latents is None:
+                self.condition_latents = self._encode_condition_latents(
+                    batch_input_image, batch_condition_images
+                )
+            condition_latents = self.condition_latents
 
         kwargs = {
             "seed": 0,
             "tiled": False,
             "input_image": batch_input_image,  # List[PIL], len = B
             "input_image4": batch_condition_images,
+            "condition_latents": condition_latents,
             "action": actions_tensor,
             "height": self.image_size[0],
             "width": self.image_size[1],
@@ -592,9 +738,17 @@ class WanEnv(BaseWorldEnv):
             "cfg_scale": 1.0,
             "progress_bar_cmd": lambda x: x,
             "batch_size": B,
+            "bs_1": False,
+            "return_latents": self.use_latent_condition_cache,
         }
 
-        output = self.pipe(**kwargs)
+        pipe_output = self.pipe(**kwargs)
+        if self.use_latent_condition_cache:
+            output, last_latents = pipe_output
+        else:
+            output = pipe_output
+            last_latents = None
+
         for env_idx in range(num_envs):
             frames = []
             for img in output[env_idx]:
@@ -624,7 +778,20 @@ class WanEnv(BaseWorldEnv):
                 *latest_frames[-num_autoreg_frames:],
             ]
 
-            all_samples.append(video[:, self.condition_frame_length :])
+            all_samples.append(
+                video[
+                    :,
+                    self.condition_frame_length : self.condition_frame_length
+                    + self.wan_predict_frames,
+                ]
+            )
+
+        if self.use_latent_condition_cache:
+            first_latent = self.condition_latents[:, :, 0:1]
+            last_generated_latent = last_latents[:, :, -1:]
+            self.condition_latents = torch.cat(
+                [first_latent, last_generated_latent], dim=2
+            ).detach()
 
         # Stack all environments: [num_envs, C, T, H, W]
         x_samples = torch.stack(all_samples, dim=0).to(self.device)
@@ -635,10 +802,7 @@ class WanEnv(BaseWorldEnv):
         # Update current observation: append new generated frames to the time dimension
         self.current_obs = torch.cat([self.current_obs, x_samples], dim=3)
 
-        # Keep only the last condition_frame_length + chunk frames
-        # Note: chunk might be different from T in x_samples due to VAE decoding
-        # We'll keep a sliding window of recent frames
-        max_frames = self.condition_frame_length + self.chunk
+        max_frames = self.condition_frame_length + self.wan_predict_frames
         if self.current_obs.shape[3] > max_frames:
             self.current_obs = self.current_obs[:, :, :, -max_frames:, :, :]
 
@@ -720,6 +884,39 @@ class WanEnv(BaseWorldEnv):
 
         return obs
 
+    def capture_image(self):
+        """Return full 3-view frames for video recording."""
+        b, _c, _v, _t, _h, _w = self.current_obs.shape
+        if b != self.num_envs:
+            raise ValueError(
+                f"Unexpected current_obs shape: {self.current_obs.shape}, "
+                f"expected first dim {self.num_envs}"
+            )
+
+        last_frame = self.current_obs[:, :, 0, -1, :, :]
+        full_image = last_frame.permute(0, 2, 3, 1)
+        full_image = (full_image + 1.0) / 2.0 * 255.0
+        full_image = torch.clamp(full_image, 0, 255)
+
+        if full_image.shape[1:3] != self.image_size:
+            full_image = full_image.permute(0, 3, 1, 2)
+            full_image = F.interpolate(
+                full_image, size=self.image_size, mode="bilinear", align_corners=False
+            )
+            full_image = full_image.permute(0, 2, 3, 1)
+
+        full_image = full_image.to(torch.uint8)
+        if self.image_layout == "vertical_3view_padded_bottom":
+            valid_height = self.view_height * self.num_views
+            if full_image.shape[1] < valid_height:
+                raise ValueError(
+                    f"Cannot capture padded 3-view image with height {full_image.shape[1]}; "
+                    f"need at least {valid_height}"
+                )
+            full_image = full_image[:, :valid_height, :, :]
+
+        return full_image
+
     def _fit_action_dim(self, action):
         action = np.asarray(action, dtype=np.float32).reshape(-1)
         if action.shape[0] < self.action_dim:
@@ -756,11 +953,15 @@ class WanEnv(BaseWorldEnv):
             if isinstance(policy_output_action, np.ndarray)
             else policy_output_action.to(self.device)
         )
-        if chunk_actions.shape[1] < 6:
+        min_state_action_len = self.action_downsample_stride * self.wan_predict_frames
+        if chunk_actions.shape[1] < min_state_action_len:
             raise ValueError(
-                f"Need at least 6 actions per chunk to build state proxy, got {chunk_actions.shape[1]}"
+                f"Need at least {min_state_action_len} actions per chunk to build "
+                f"state proxy, got {chunk_actions.shape[1]}"
             )
-        self.state_proxy = chunk_actions[:, -6, : self.action_dim].detach().to(
+        self.state_proxy = chunk_actions[
+            :, self.action_downsample_stride * self.wan_predict_frames - 1, : self.action_dim
+        ].detach().to(
             device=self.device, dtype=torch.float32
         )
 
@@ -841,6 +1042,8 @@ class WanEnv(BaseWorldEnv):
         self.pipe.dit = self.pipe.dit.to("cpu")
         self.reward_model = self.reward_model.to("cpu")
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
+        if self.condition_latents is not None:
+            self.condition_latents = self.condition_latents.cpu()
         self.state_proxy = self.state_proxy.cpu()
         self.prev_step_reward = self.prev_step_reward.cpu()
         self.reset_state_ids = self.reset_state_ids.cpu()
@@ -858,6 +1061,8 @@ class WanEnv(BaseWorldEnv):
         self.pipe.vae = self.pipe.vae.to(self.device)
         self.reward_model = self.reward_model.to(self.device)
         self.current_obs = recursive_to_device(self.current_obs, self.device)
+        if self.condition_latents is not None:
+            self.condition_latents = self.condition_latents.to(self.device)
         self.state_proxy = self.state_proxy.to(self.device)
         self.prev_step_reward = self.prev_step_reward.to(self.device)
         self.reset_state_ids = self.reset_state_ids.to(self.device)
@@ -871,6 +1076,9 @@ class WanEnv(BaseWorldEnv):
         env_state = {
             "current_obs": recursive_to_device(self.current_obs, "cpu")
             if self.current_obs is not None
+            else None,
+            "condition_latents": self.condition_latents.cpu()
+            if self.condition_latents is not None
             else None,
             "task_descriptions": self.task_descriptions,
             "init_ee_poses": self.init_ee_poses,

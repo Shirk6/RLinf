@@ -31,7 +31,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 5
+  save_interval: 10
 
   resume_dir: null
   ckpt_path: null
@@ -91,7 +91,7 @@ env:
     max_steps_per_rollout_epoch: 3072
     
     reward_coef: ${algorithm.reward_coef}
-    wan_wm_hf_ckpt_path: "/project/peilab/srk/rss_2026_ws/models/wan-tower"
+    wan_wm_hf_ckpt_path: "/project/peilab/srk/rss_2026_ws/models/wan-battery"
     enable_offload: True
     num_inference_steps: 5
     reward_model:

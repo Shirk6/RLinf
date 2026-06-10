@@ -35,20 +35,31 @@ wan_wm_hf_ckpt_path: null
 VAE_path: ${env.train.wan_wm_hf_ckpt_path}/Wan2.2_VAE.pth
 model_path: ${env.train.wan_wm_hf_ckpt_path}/model-00001.safetensors
 
-enable_kir: True
+enable_kir: False
+use_latent_condition_cache: True
 initial_image_path: ${env.train.wan_wm_hf_ckpt_path}/dataset/
 
 num_inference_steps: 5
 action_dim: 14
 chunk: 48
-condition_frame_length: 9
+condition_frame_length: 5
+wan_predict_frames: 8
+action_downsample_stride: 6
 image_size: [544, 320]
 image_layout: vertical_3view_padded_bottom
 view_height: 180
 num_views: 3
 padding_bottom: 4
-num_frames: 57
+num_frames: 13
 
 reward_model:
-  type: ResnetRewModel
+  type: ResNetRewardModel
   from_pretrained: ${env.train.wan_wm_hf_ckpt_path}/resnet_rm.pth
+  pretrained: False
+  arch: resnet18
+  hidden_dim: 256
+  dropout: 0
+  image_size: [3, 544, 320]
+  normalize: True
+  precision: fp32
+  reward_threshold: 0.5

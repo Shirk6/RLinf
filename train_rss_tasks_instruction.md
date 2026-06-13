@@ -38,7 +38,7 @@ git lfs install
 ## 2. 获取代码
 
 ```bash
-git clone https://github.com/RLinf/RLinf.git
+git clone https://github.com/Shirk6/RLinf.git
 cd RLinf
 ```
 

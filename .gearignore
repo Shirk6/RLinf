@@ -1,0 +1,16 @@
+.git/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+outputs/
+logs/
+results/
+models/
+*.pyc
+*.pyo
+*.zip
+*.tar
+*.tar.gz
+*.sif

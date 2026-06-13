@@ -1,0 +1,537 @@
+#####################################################################################
+# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto. Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+#####################################################################################
+workflow:
+  name: {{ workflow_name }}
+  timeout:
+    queue_timeout: {{ queue_timeout | default('1d') }}
+  resources:
+    default:
+      cpu: {{cpus}}
+      gpu: {{gpus}}
+      memory: {{memory}}Gi
+      storage: {{storage}}Gi
+  groups:
+  - name: training
+    tasks:
+    {% for item in range(num_nodes) %}
+    {% if item == 0 %}
+    - name: "master"
+    {% else %}
+    - name: "worker_{{item}}"
+    {% endif %}
+      image: {{image}}
+      credentials:
+        gear-aws-cred:
+          AWS_ACCESS_KEY_ID: aws_access_key_id
+          AWS_SECRET_ACCESS_KEY: aws_secret_access_key
+          AWS_DEFAULT_REGION: aws_default_region
+          AWS_ENDPOINT_URL: aws_endpoint_url
+        gear-data-credentials:
+          GEAR_DATA_CREDENTIALS: data_credentials
+      command: [ "bash"]
+      exitActions:
+        COMPLETE: 0
+      {% if item == 0 %}
+      lead: true
+      args: ["/tmp/entry.sh"]
+      files:
+      - path: /tmp/entry.sh
+        contents: |
+          # Redirect entry script output to file for log collection
+          exec > >(tee /tmp/entry_script.log) 2>&1
+
+          # Install packages
+          apt update
+          export DEBIAN_FRONTEND=noninteractive
+          apt install -y tzdata
+          ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+          apt install -y netcat dnsutils openssh-server unzip curl
+          set -x
+          pip install smart_open --upgrade
+          pip install "ray[train,default,tune]"==2.48.0
+
+          ##############################################################
+          pip uninstall apex -y
+          pip install sentencepiece
+          pip install boto3>=1.36
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update && rm -rf /tmp/awscliv2.zip /tmp/aws
+          ##############################################################
+
+          # Setup working directory if workdir_path is provided
+          {% if workdir_path and workdir_path != "" %}
+          echo "============================================"
+          echo "Downloading workdir from: {{workdir_path}}"
+          echo "============================================"
+
+          # Download and extract the zip file
+          mkdir -p ~/downloads
+          osmo data download "{{workdir_path}}" ~/downloads/
+          ZIP_FILE=~/downloads/$(basename "{{workdir_path}}")
+
+          echo "============================================"
+          echo "Extracting workdir"
+          echo "============================================"
+          mkdir -p ~/workdir
+          unzip -q "$ZIP_FILE" -d ~/workdir/
+          cd ~/workdir/
+          export WORKDIR_PATH="$(pwd)"
+          echo "Ready to work in: $WORKDIR_PATH"
+          echo "============================================"
+          {% else %}
+          echo "============================================"
+          echo "No workdir_path provided - using default workdir: {{workdir}}"
+          echo "============================================"
+          export WORKDIR_PATH="{{workdir}}"
+          cd "$WORKDIR_PATH"
+          {% endif %}
+
+          # RLinf multi-node workers must start Ray from the same Wan/OpenPI
+          # environment on every node.
+          if command -v switch_env >/dev/null 2>&1 && source switch_env openpi; then
+            echo "Using prebuilt openpi environment"
+          elif [ -f /opt/venv/openpi/bin/activate ]; then
+            source /opt/venv/openpi/bin/activate
+          else
+            bash requirements/install.sh embodied --model openpi --env wan --venv /opt/venv/openpi
+            source /opt/venv/openpi/bin/activate
+          fi
+          python - <<'PY'
+          import importlib.util
+          import subprocess
+          import sys
+
+          missing = []
+          if importlib.util.find_spec("huggingface_hub") is None:
+              missing.append("huggingface_hub<1.0")
+          if importlib.util.find_spec("wandb") is None:
+              missing.append("wandb<0.25.1")
+          if missing:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+          PY
+
+          # Keep every requested H100 visible to Ray. Filtering a single card here
+          # makes an 8-node job expose 63/64 GPUs and blocks RLinf startup.
+          CUDA_DEVICE_LIST="$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | tr '\n' ',' | sed 's/,$//')"
+          if [ -n "${CUDA_DEVICE_LIST}" ]; then
+            export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}"
+          fi
+          echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
+
+          # Configure SSH when the image provides sshd. Some Gear images omit
+          # openssh-server even after apt install succeeds against stale indexes.
+          SSHD_CONFIG="/etc/ssh/sshd_config"
+          if [ -f "$SSHD_CONFIG" ] && [ -x /usr/sbin/sshd ]; then
+            sed -i 's/#\?Port .*/Port 22/' "$SSHD_CONFIG"
+            sed -i 's/#\?ListenAddress .*/ListenAddress 0.0.0.0/' "$SSHD_CONFIG"
+            sed -i 's/#\?PermitRootLogin .*/PermitRootLogin yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?PasswordAuthentication .*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?PermitEmptyPasswords .*/PermitEmptyPasswords yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?UsePAM .*/UsePAM no/' "$SSHD_CONFIG"
+            sed -i 's/#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' "$SSHD_CONFIG"
+            passwd -d root || true
+            mkdir -p /var/run/sshd
+            chmod 0755 /var/run/sshd
+            /usr/sbin/sshd
+          else
+            echo "sshd is unavailable; skipping SSH setup"
+          fi
+
+          export MASTER_ADDR=$(hostname -I | awk '{print $1}')
+
+          # Download and install Vector for log collection to S3
+          VECTOR_VERSION=0.43.1
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            VECTOR_ARCH="aarch64-unknown-linux-gnu"
+          else
+            VECTOR_ARCH="x86_64-unknown-linux-gnu"
+          fi
+          curl -sSfL "https://packages.timber.io/vector/${VECTOR_VERSION}/vector-${VECTOR_VERSION}-${VECTOR_ARCH}.tar.gz" \
+            | tar xz -C /tmp || true
+          cp /tmp/vector-${VECTOR_ARCH}/bin/vector /usr/local/bin/vector 2>/dev/null || true
+
+          # Start Vector log collection in background
+          export NODE_NAME="head_node"
+          echo "Starting Vector log collection for head node $NODE_NAME"
+          if command -v vector &> /dev/null; then
+            mkdir -p /tmp/vector-data
+            vector --config /tmp/vector.toml > /dev/null 2>&1 &
+          fi
+          # Enable DCGM NCCL Tests
+          export DCGM_NCCL_TESTS_BIN_PATH=/usr/local/bin/
+          nv-hostengine
+          export RLINF_NODE_RANK=0
+          echo 'export RLINF_NODE_RANK=0' >> /etc/environment
+          echo 'export RLINF_NODE_RANK=0' >> /etc/profile
+        
+          # start ray
+          ray start --head --port={{ray_port}}
+          # sleep to allow other task nodes to connect to the master task via ray
+          sleep 20s
+          
+          echo "Skipping DCGM diagnostics; RLinf will verify 64 Ray GPUs before training"
+
+          {% if user_command %}
+          echo "Submitting Ray job with command: {{user_command}}"
+
+          JOB_ID="job_$(date +%s)_$(printf '%04x' $RANDOM)"
+          echo "Using submission ID: $JOB_ID"
+
+          set +x
+          {% if workdir_path and workdir_path != "" %}
+          ray job submit --submission-id="$JOB_ID" --working-dir="$WORKDIR_PATH" --runtime-env-json '{{runtime_env_json}}' -- {{user_command}}
+          {% else %}
+          ray job submit --submission-id="$JOB_ID" --runtime-env-json '{{runtime_env_json}}' -- {{user_command}}
+          {% endif %}
+          set -x
+
+          echo "Job submitted successfully with ID: $JOB_ID"
+          echo "Monitoring job logs..."
+
+          ray job logs "$JOB_ID" --follow
+
+          JOB_STATUS=$(ray job status "$JOB_ID" --address=http://127.0.0.1:8265)
+          echo "Job finished with status: $JOB_STATUS"
+
+          if echo "$JOB_STATUS" | grep -q "succeeded"; then
+            echo "Job succeeded! Exiting..."
+            exit 0
+          else
+            echo "Job failed or was stopped. Exiting with error code..."
+            exit 1
+          fi
+          {% else %}
+          # No user command provided, keep cluster running
+          sleep infinity
+          {% endif %}
+      - path: /tmp/flops-check.py
+        contents: |
+          import time
+          import subprocess
+          import multiprocessing as mp
+          from typing import Tuple, List
+          import torch
+
+          # CONFIGURATION - Adjust these parameters as needed
+          MATRIX_SIZE = 16384          # Size of matrices for benchmark (NxN)
+          BENCHMARK_DURATION_SEC = 60  # How long to run the stress test
+          WARMUP_DURATION_SEC = 5      # Warmup time to stabilize GPU clocks
+          TFLOPS_TOLERANCE = 0.15      # 15% = GPU must be within 15% of best GPU
+          MAX_TEMPERATURE_C = 80       # Max allowed temperature (GPUs throttle ~83C)
+
+          # Ensure FP32 matmul (disable TF32)
+          torch.backends.cuda.matmul.allow_tf32 = False
+
+          def get_gpu_temperatures() -> List[float]:
+            out = subprocess.check_output([
+              "nvidia-smi",
+              "--query-gpu=temperature.gpu",
+              "--format=csv,noheader,nounits",
+            ]).decode().strip().splitlines()
+            return [float(x) for x in out]
+
+          def benchmark_gpu(device_id: int) -> Tuple[int, float, float]:
+            device = torch.device(f"cuda:{device_id}")
+            torch.cuda.set_device(device)
+            torch.cuda.synchronize(device)
+
+            A = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+            B = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+            flop_per_iter = 2 * MATRIX_SIZE * MATRIX_SIZE * MATRIX_SIZE
+
+            # Warmup phase
+            torch.cuda.synchronize(device)
+            warmup_start = time.time()
+            while time.time() - warmup_start < WARMUP_DURATION_SEC:
+              torch.mm(A, B)
+              torch.cuda.synchronize(device)
+
+            # Timed benchmark phase
+            flop = 0
+            start = time.time()
+            while time.time() - start < BENCHMARK_DURATION_SEC:
+              torch.mm(A, B)
+              flop += flop_per_iter
+              torch.cuda.synchronize(device)
+            end = time.time()
+
+            tflops = flop / (end - start) / 1e12
+            temperatures = get_gpu_temperatures()
+            temp_c = temperatures[device_id] if device_id < len(temperatures) else 1000.0
+            return device_id, tflops, temp_c
+
+          if __name__ == "__main__":
+            import sys
+            assert torch.cuda.is_available(), "CUDA is not available. Please check your PyTorch installation."
+            num_gpus = torch.cuda.device_count()
+
+            with mp.get_context("spawn").Pool(num_gpus) as pool:
+              results = pool.map(benchmark_gpu, range(num_gpus))
+
+            # Relative comparison approach (inspired by gpu-fryer)
+            tflops_list = [t for _, t, _ in results]
+            best_tflops = max(tflops_list)
+            min_acceptable_tflops = best_tflops * (1 - TFLOPS_TOLERANCE)
+
+            good_gpus = [
+              str(d) for d, t, temp in results
+              if t >= min_acceptable_tflops and temp < MAX_TEMPERATURE_C
+            ]
+
+            # Diagnostic output to stderr (won't affect CUDA_VISIBLE_DEVICES)
+            print(f"GPU Health Check Results:", file=sys.stderr)
+            print(f"  Best TFLOPS: {best_tflops:.1f}", file=sys.stderr)
+            print(f"  Min acceptable: {min_acceptable_tflops:.1f} ({TFLOPS_TOLERANCE*100:.0f}% tolerance)", file=sys.stderr)
+            print(f"  Max temp: {MAX_TEMPERATURE_C}C", file=sys.stderr)
+            for d, t, temp in results:
+              status = "PASS" if str(d) in good_gpus else "FAIL"
+              print(f"  GPU {d}: {t:.1f} TFLOPS, {temp:.1f}C [{status}]", file=sys.stderr)
+            print(f"  Healthy GPUs: {len(good_gpus)}/{num_gpus}", file=sys.stderr)
+
+            print(",".join(good_gpus))
+          # RUN YOUR COMMAND HERE
+
+      {% else %}
+      args: ["/tmp/entry{{item}}.sh"]
+      files:
+      - path: /tmp/entry{{item}}.sh
+        contents: |
+          # Redirect entry script output to file for log collection
+          exec > >(tee /tmp/entry_script.log) 2>&1
+
+          # Install packages
+          apt update
+          export DEBIAN_FRONTEND=noninteractive
+          apt install -y tzdata
+          ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+          apt install -y netcat dnsutils openssh-server unzip curl
+          set -x
+          pip install smart_open --upgrade
+          pip install "ray[train,default,tune]"==2.48.0
+
+          ##############################################################
+          pip uninstall apex -y
+          pip install sentencepiece
+          pip install boto3>=1.36
+          curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+          unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install --update && rm -rf /tmp/awscliv2.zip /tmp/aws
+          ##############################################################
+
+          # Setup working directory if workdir_path is provided
+          {% if workdir_path and workdir_path != "" %}
+          echo "============================================"
+          echo "Downloading workdir from: {{workdir_path}}"
+          echo "============================================"
+
+          # Download and extract the zip file
+          mkdir -p ~/downloads
+          osmo data download "{{workdir_path}}" ~/downloads/
+          ZIP_FILE=~/downloads/$(basename "{{workdir_path}}")
+
+          echo "============================================"
+          echo "Extracting workdir"
+          echo "============================================"
+          mkdir -p ~/workdir
+          unzip -q "$ZIP_FILE" -d ~/workdir/
+          cd ~/workdir/
+          export WORKDIR_PATH="$(pwd)"
+          echo "Ready to work in: $WORKDIR_PATH"
+          echo "============================================"
+          {% else %}
+          echo "============================================"
+          echo "No workdir_path provided - using default workdir: {{workdir}}"
+          echo "============================================"
+          export WORKDIR_PATH="{{workdir}}"
+          cd "$WORKDIR_PATH"
+          {% endif %}
+
+          # RLinf multi-node workers must start Ray from the same Wan/OpenPI
+          # environment on every node.
+          if command -v switch_env >/dev/null 2>&1 && source switch_env openpi; then
+            echo "Using prebuilt openpi environment"
+          elif [ -f /opt/venv/openpi/bin/activate ]; then
+            source /opt/venv/openpi/bin/activate
+          else
+            bash requirements/install.sh embodied --model openpi --env wan --venv /opt/venv/openpi
+            source /opt/venv/openpi/bin/activate
+          fi
+          python - <<'PY'
+          import importlib.util
+          import subprocess
+          import sys
+
+          missing = []
+          if importlib.util.find_spec("huggingface_hub") is None:
+              missing.append("huggingface_hub<1.0")
+          if importlib.util.find_spec("wandb") is None:
+              missing.append("wandb<0.25.1")
+          if missing:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+          PY
+
+          # Keep every requested H100 visible to Ray. Filtering a single card here
+          # makes an 8-node job expose 63/64 GPUs and blocks RLinf startup.
+          CUDA_DEVICE_LIST="$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits | tr '\n' ',' | sed 's/,$//')"
+          if [ -n "${CUDA_DEVICE_LIST}" ]; then
+            export CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}"
+          fi
+          echo "Using CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
+
+          # Configure SSH when the image provides sshd. Some Gear images omit
+          # openssh-server even after apt install succeeds against stale indexes.
+          SSHD_CONFIG="/etc/ssh/sshd_config"
+          if [ -f "$SSHD_CONFIG" ] && [ -x /usr/sbin/sshd ]; then
+            sed -i 's/#\?Port .*/Port 22/' "$SSHD_CONFIG"
+            sed -i 's/#\?ListenAddress .*/ListenAddress 0.0.0.0/' "$SSHD_CONFIG"
+            sed -i 's/#\?PermitRootLogin .*/PermitRootLogin yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?PasswordAuthentication .*/PasswordAuthentication yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?PermitEmptyPasswords .*/PermitEmptyPasswords yes/' "$SSHD_CONFIG"
+            sed -i 's/#\?UsePAM .*/UsePAM no/' "$SSHD_CONFIG"
+            sed -i 's/#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' "$SSHD_CONFIG"
+            passwd -d root || true
+            mkdir -p /var/run/sshd
+            chmod 0755 /var/run/sshd
+            /usr/sbin/sshd
+          else
+            echo "sshd is unavailable; skipping SSH setup"
+          fi
+
+          # Download and install Vector for log collection to S3
+          VECTOR_VERSION=0.43.1
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ]; then
+            VECTOR_ARCH="aarch64-unknown-linux-gnu"
+          else
+            VECTOR_ARCH="x86_64-unknown-linux-gnu"
+          fi
+          curl -sSfL "https://packages.timber.io/vector/${VECTOR_VERSION}/vector-${VECTOR_VERSION}-${VECTOR_ARCH}.tar.gz" \
+            | tar xz -C /tmp || true
+          cp /tmp/vector-${VECTOR_ARCH}/bin/vector /usr/local/bin/vector 2>/dev/null || true
+
+          # Start Vector log collection in background
+          export NODE_NAME="worker_{{item}}"
+          echo "Starting Vector log collection for worker node $NODE_NAME"
+          if command -v vector &> /dev/null; then
+            mkdir -p /tmp/vector-data
+            vector --config /tmp/vector.toml > /dev/null 2>&1 &
+          fi
+          # Enable DCGM NCCL Tests
+          export DCGM_NCCL_TESTS_BIN_PATH=/usr/local/bin/
+          nv-hostengine
+          export RLINF_NODE_RANK={{item}}
+          echo 'export RLINF_NODE_RANK={{item}}' >> /etc/environment
+          echo 'export RLINF_NODE_RANK={{item}}' >> /etc/profile
+          
+          # Set the MASTER_ADDR environment variable for Pytorch Distributed to
+          # communicate with the master task
+          ray start --address={{host:master}}:{{ray_port}} --block
+
+      - path: /tmp/flops-check.py
+        contents: |
+          import time
+          import subprocess
+          import multiprocessing as mp
+          from typing import Tuple, List
+          import torch
+
+          # CONFIGURATION - Adjust these parameters as needed
+          MATRIX_SIZE = 16384          # Size of matrices for benchmark (NxN)
+          BENCHMARK_DURATION_SEC = 60  # How long to run the stress test
+          WARMUP_DURATION_SEC = 5      # Warmup time to stabilize GPU clocks
+          TFLOPS_TOLERANCE = 0.15      # 15% = GPU must be within 15% of best GPU
+          MAX_TEMPERATURE_C = 80       # Max allowed temperature (GPUs throttle ~83C)
+
+          # Ensure FP32 matmul (disable TF32)
+          torch.backends.cuda.matmul.allow_tf32 = False
+
+          def get_gpu_temperatures() -> List[float]:
+            out = subprocess.check_output([
+              "nvidia-smi",
+              "--query-gpu=temperature.gpu",
+              "--format=csv,noheader,nounits",
+            ]).decode().strip().splitlines()
+            return [float(x) for x in out]
+
+          def benchmark_gpu(device_id: int) -> Tuple[int, float, float]:
+            device = torch.device(f"cuda:{device_id}")
+
+            # Initialize CUDA context for this specific device
+            torch.cuda.set_device(device)
+            torch.cuda.synchronize(device)
+
+            A = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+            B = torch.randn(MATRIX_SIZE, MATRIX_SIZE, device=device)
+            flop_per_iter = 2 * MATRIX_SIZE * MATRIX_SIZE * MATRIX_SIZE
+
+            # Warmup phase
+            torch.cuda.synchronize(device)
+            warmup_start = time.time()
+            while time.time() - warmup_start < WARMUP_DURATION_SEC:
+              torch.mm(A, B)
+              torch.cuda.synchronize(device)
+
+            # Timed benchmark phase
+            flop = 0
+            start = time.time()
+            while time.time() - start < BENCHMARK_DURATION_SEC:
+              torch.mm(A, B)
+              flop += flop_per_iter
+              torch.cuda.synchronize(device)
+            end = time.time()
+
+            tflops = flop / (end - start) / 1e12
+            temperatures = get_gpu_temperatures()
+            temp_c = temperatures[device_id] if device_id < len(temperatures) else 1000.0
+            return device_id, tflops, temp_c
+
+          if __name__ == "__main__":
+            import sys
+            assert torch.cuda.is_available(), "CUDA is not available. Please check your PyTorch installation."
+            num_gpus = torch.cuda.device_count()
+
+            with mp.get_context("spawn").Pool(num_gpus) as pool:
+              results = pool.map(benchmark_gpu, range(num_gpus))
+
+            # Relative comparison approach (inspired by gpu-fryer)
+            tflops_list = [t for _, t, _ in results]
+            best_tflops = max(tflops_list)
+            min_acceptable_tflops = best_tflops * (1 - TFLOPS_TOLERANCE)
+
+            good_gpus = [
+              str(d) for d, t, temp in results
+              if t >= min_acceptable_tflops and temp < MAX_TEMPERATURE_C
+            ]
+
+            # Diagnostic output to stderr
+            print(f"GPU Health Check Results:", file=sys.stderr)
+            print(f"  Best TFLOPS: {best_tflops:.1f}", file=sys.stderr)
+            print(f"  Min acceptable: {min_acceptable_tflops:.1f} ({TFLOPS_TOLERANCE*100:.0f}% tolerance)", file=sys.stderr)
+            print(f"  Max temp: {MAX_TEMPERATURE_C}C", file=sys.stderr)
+            for d, t, temp in results:
+              status = "PASS" if str(d) in good_gpus else "FAIL"
+              print(f"  GPU {d}: {t:.1f} TFLOPS, {temp:.1f}C [{status}]", file=sys.stderr)
+            print(f"  Healthy GPUs: {len(good_gpus)}/{num_gpus}", file=sys.stderr)
+
+            print(",".join(good_gpus))
+      {% endif %}
+    {% endfor %}
+default-values:
+  image: nvcr.io/nvidian/gear-trinity-train:latest
+  workflow_name: ray_cluster
+  ray_port: 6376
+  num_nodes: 1
+  gpus: 0
+  cpus: 1
+  memory: 32
+  storage: 32
+  workdir: /workspace/
+  workdir_path: ""  # Optional: S3 path to zip file containing working directory (e.g., "s3://bucket/path/workdir.zip"). If provided, will be downloaded and extracted.
+  user_command: ""  # Optional: Ray job command to run (e.g., "python train.py"). If empty, cluster stays alive.
+  runtime_env_json: {}

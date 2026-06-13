@@ -118,7 +118,7 @@ class WanEnv(BaseWorldEnv):
         self.pipe = self._build_pipeline()
 
         # Load reward model if specified
-        self.reward_model = self._load_reward_model().eval().to(self.device)
+        self._load_reward_models()
 
         # Initialize state
         # Will be a tensor [num_envs, 3, 1, T, h, w]
@@ -126,9 +126,13 @@ class WanEnv(BaseWorldEnv):
         self.condition_latents = None
         self.task_descriptions = [""] * self.num_envs
         self.init_ee_poses = [None] * self.num_envs
+        self.current_subtask_ids = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self.state_proxy = torch.zeros(
             self.num_envs, self.action_dim, device=self.device, dtype=torch.float32
         )
+        self.latest_generated_frames = None
 
         # Image queue for condition frames to generate video. The first frame
         # is the reset reference frame and remains fixed during autoregressive rollout.
@@ -162,9 +166,50 @@ class WanEnv(BaseWorldEnv):
         self._is_offloaded = False
 
     def _build_dataset(self, cfg):
-        return NpyTrajectoryDatasetWrapper(
-            cfg.initial_image_path, enable_kir=self.enable_kir
-        )
+        self.use_subtasks = bool(cfg.get("subtasks", {}).get("enabled", False))
+        if not self.use_subtasks:
+            return NpyTrajectoryDatasetWrapper(
+                cfg.initial_image_path, enable_kir=self.enable_kir
+            )
+
+        subtask_items = cfg.subtasks.get("items", [])
+        if len(subtask_items) == 0:
+            raise ValueError("env.subtasks.enabled=True requires subtasks.items")
+
+        self.subtask_names = []
+        self.subtask_datasets = []
+        self.subtask_reward_model_cfgs = []
+        subtask_weights = []
+
+        base_reward_model_cfg = cfg.get("reward_model", {})
+        for subtask_idx, subtask_cfg in enumerate(subtask_items):
+            name = str(subtask_cfg.get("name", f"subtask_{subtask_idx}"))
+            initial_image_path = subtask_cfg.get("initial_image_path", None)
+            if initial_image_path is None:
+                raise ValueError(f"Subtask {name} must define initial_image_path")
+
+            reward_model_cfg = subtask_cfg.get("reward_model", None)
+            if reward_model_cfg is None:
+                raise ValueError(f"Subtask {name} must define reward_model")
+
+            merged_reward_model_cfg = OmegaConf.merge(
+                base_reward_model_cfg, reward_model_cfg
+            )
+
+            self.subtask_names.append(name)
+            self.subtask_datasets.append(
+                NpyTrajectoryDatasetWrapper(
+                    initial_image_path, enable_kir=self.enable_kir
+                )
+            )
+            self.subtask_reward_model_cfgs.append(merged_reward_model_cfg)
+            subtask_weights.append(float(subtask_cfg.get("weight", 1.0)))
+
+        if any(weight < 0 for weight in subtask_weights) or sum(subtask_weights) <= 0:
+            raise ValueError("Subtask weights must be non-negative with positive sum")
+
+        self.subtask_weights = torch.tensor(subtask_weights, dtype=torch.float32)
+        return self.subtask_datasets[0]
 
     def _build_pipeline(self):
         pipe = WanVideoPipeline.from_pretrained(
@@ -181,23 +226,37 @@ class WanEnv(BaseWorldEnv):
         pipe.vae.to(self.device)
         return pipe
 
-    def _load_reward_model(self):
-        if self.cfg.reward_model.type == "ResnetRewModel":
-            rew_model = ResnetRewModel(self.cfg.reward_model.from_pretrained)
-        elif self.cfg.reward_model.type == "ResNetRewardModel":
+    def _load_reward_model(self, reward_model_cfg=None):
+        if reward_model_cfg is None:
+            reward_model_cfg = self.cfg.reward_model
+        if reward_model_cfg.type == "ResnetRewModel":
+            rew_model = ResnetRewModel(reward_model_cfg.from_pretrained)
+        elif reward_model_cfg.type == "ResNetRewardModel":
             reward_model_cfg = OmegaConf.create(
-                OmegaConf.to_container(self.cfg.reward_model, resolve=True)
+                OmegaConf.to_container(reward_model_cfg, resolve=True)
             )
-            reward_model_cfg.model_path = self.cfg.reward_model.from_pretrained
+            reward_model_cfg.model_path = reward_model_cfg.from_pretrained
             rew_model = ResNetRewardModel(reward_model_cfg)
-        elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
+        elif reward_model_cfg.type == "TaskEmbedResnetRewModel":
             rew_model = TaskEmbedResnetRewModel(
-                checkpoint_path=self.cfg.reward_model.from_pretrained,
+                checkpoint_path=reward_model_cfg.from_pretrained,
                 task_suite_name=self.cfg.task_suite_name,
             )
         else:
-            raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
+            raise ValueError(f"Unknown reward model type: {reward_model_cfg.type}")
         return rew_model
+
+    def _load_reward_models(self):
+        if not self.use_subtasks:
+            self.reward_model = self._load_reward_model().eval().to(self.device)
+            self.reward_models = None
+            return
+
+        self.reward_models = [
+            self._load_reward_model(reward_model_cfg).eval().to(self.device)
+            for reward_model_cfg in self.subtask_reward_model_cfgs
+        ]
+        self.reward_model = self.reward_models[0]
 
     def _init_metrics(self):
         self.success_once = torch.zeros(
@@ -301,23 +360,118 @@ class WanEnv(BaseWorldEnv):
             expanded = torch.cat([expanded, pad], dim=1)
         return expanded[:, : self.chunk]
 
-    def update_reset_state_ids(self):
-        """Updates the reset state IDs for environment initialization."""
-        # Get total number of episodes available
-        total_num_episodes = len(self.dataset)
-
-        # Generate random reset state ids
-        reset_state_ids = torch.randint(
-            low=0,
-            high=total_num_episodes,
-            size=(self.num_group,),
+    def _sample_group_subtask_ids(self):
+        if not self.use_subtasks:
+            return torch.zeros(self.num_group, dtype=torch.long)
+        return torch.multinomial(
+            self.subtask_weights,
+            num_samples=self.num_group,
+            replacement=True,
             generator=self._generator,
         )
 
-        # Repeat for each environment in the group
+    def update_reset_state_ids(self):
+        """Updates the reset state IDs for environment initialization."""
+        if self.num_envs % self.group_size != 0:
+            raise ValueError(
+                f"num_envs ({self.num_envs}) must be divisible by group_size ({self.group_size})"
+            )
+
+        group_subtask_ids = self._sample_group_subtask_ids()
+        group_reset_state_ids = []
+        for subtask_id in group_subtask_ids.tolist():
+            dataset = (
+                self.subtask_datasets[subtask_id]
+                if self.use_subtasks
+                else self.dataset
+            )
+            total_num_episodes = len(dataset)
+            if total_num_episodes <= 0:
+                raise ValueError(
+                    f"No episodes available for subtask {subtask_id}"
+                )
+            group_reset_state_ids.append(
+                torch.randint(
+                    low=0,
+                    high=total_num_episodes,
+                    size=(1,),
+                    generator=self._generator,
+                ).item()
+            )
+
+        reset_state_ids = torch.tensor(group_reset_state_ids, dtype=torch.long)
         self.reset_state_ids = reset_state_ids.repeat_interleave(
             repeats=self.group_size
         ).to(self.device)
+        self.reset_subtask_ids = group_subtask_ids.repeat_interleave(
+            repeats=self.group_size
+        ).to(self.device)
+
+    def _normalize_episode_indices(self, episode_indices):
+        if isinstance(episode_indices, torch.Tensor):
+            episode_indices = episode_indices.cpu().numpy()
+        return np.asarray(episode_indices, dtype=np.int64)
+
+    def _normalize_subtask_ids(self, subtask_ids):
+        if isinstance(subtask_ids, torch.Tensor):
+            subtask_ids = subtask_ids.cpu().numpy()
+        return np.asarray(subtask_ids, dtype=np.int64)
+
+    def _sample_reset_selection(self, seed, episode_indices=None, subtask_ids=None):
+        if subtask_ids is not None:
+            subtask_ids = self._normalize_subtask_ids(subtask_ids)
+        if episode_indices is not None:
+            episode_indices = self._normalize_episode_indices(episode_indices)
+
+        if episode_indices is not None and len(episode_indices) != self.num_envs:
+            raise ValueError(
+                f"episode_indices length {len(episode_indices)} != num_envs {self.num_envs}"
+            )
+        if subtask_ids is not None and len(subtask_ids) != self.num_envs:
+            raise ValueError(
+                f"subtask_ids length {len(subtask_ids)} != num_envs {self.num_envs}"
+            )
+
+        if seed is not None:
+            if isinstance(seed, list):
+                np.random.seed(seed[0])
+            else:
+                np.random.seed(seed)
+
+        if not self.use_subtasks:
+            if len(self.dataset) < self.num_envs:
+                raise ValueError(
+                    f"Not enough episodes in dataset. Found {len(self.dataset)}, need {self.num_envs}"
+                )
+            if episode_indices is None:
+                episode_indices = np.random.choice(
+                    len(self.dataset), size=self.num_envs, replace=False
+                )
+            subtask_ids = np.zeros(self.num_envs, dtype=np.int64)
+            return episode_indices, subtask_ids
+
+        if episode_indices is not None and subtask_ids is None:
+            subtask_ids = self.current_subtask_ids.detach().cpu().numpy()
+            if len(subtask_ids) != self.num_envs:
+                subtask_ids = np.zeros(self.num_envs, dtype=np.int64)
+            return episode_indices, subtask_ids
+
+        if episode_indices is not None:
+            return episode_indices, subtask_ids
+
+        group_subtask_ids = self._sample_group_subtask_ids().numpy()
+        selected_episode_indices = []
+        selected_subtask_ids = []
+        for subtask_id in group_subtask_ids:
+            dataset = self.subtask_datasets[int(subtask_id)]
+            episode_idx = int(np.random.randint(0, len(dataset)))
+            selected_episode_indices.extend([episode_idx] * self.group_size)
+            selected_subtask_ids.extend([int(subtask_id)] * self.group_size)
+
+        return (
+            np.asarray(selected_episode_indices, dtype=np.int64),
+            np.asarray(selected_subtask_ids, dtype=np.int64),
+        )
 
     @torch.no_grad()
     def reset(
@@ -329,36 +483,24 @@ class WanEnv(BaseWorldEnv):
     ):
         self.onload()
         self.elapsed_steps = 0
+        subtask_ids = None
+        if options is not None:
+            subtask_ids = options.get("subtask_ids", None)
 
         # Handle first reset with fixed reset state ids
         if self.is_start:
             if self.use_fixed_reset_state_ids:
                 episode_indices = self.reset_state_ids
+                if self.use_subtasks:
+                    subtask_ids = self.reset_subtask_ids
             self._is_start = False
 
-        num_envs = self.num_envs
-        if len(self.dataset) < num_envs:
-            raise ValueError(
-                f"Not enough episodes in dataset. Found {len(self.dataset)}, need {num_envs}"
-            )
-
-        # If episode_indices not provided, randomly select
-        if episode_indices is None:
-            # Set random seed if provided
-            if seed is not None:
-                if isinstance(seed, list):
-                    np.random.seed(seed[0])
-                else:
-                    np.random.seed(seed)
-
-            # Randomly select episode indices
-            episode_indices = np.random.choice(
-                len(self.dataset), size=num_envs, replace=False
-            )
-        else:
-            # Convert to numpy if tensor
-            if isinstance(episode_indices, torch.Tensor):
-                episode_indices = episode_indices.cpu().numpy()
+        episode_indices, subtask_ids = self._sample_reset_selection(
+            seed=seed, episode_indices=episode_indices, subtask_ids=subtask_ids
+        )
+        self.current_subtask_ids = torch.as_tensor(
+            subtask_ids, dtype=torch.long, device=self.device
+        )
 
         # Load first frame from each selected episode
         img_tensors = []
@@ -366,9 +508,16 @@ class WanEnv(BaseWorldEnv):
         init_ee_poses = []
         condition_actions = []
 
-        for env_idx, episode_idx in enumerate(episode_indices):
+        for env_idx, (episode_idx, subtask_id) in enumerate(
+            zip(episode_indices, subtask_ids)
+        ):
             # Get episode data from dataset wrapper
-            episode_data = self.dataset[episode_idx]
+            dataset = (
+                self.subtask_datasets[int(subtask_id)]
+                if self.use_subtasks
+                else self.dataset
+            )
+            episode_data = dataset[int(episode_idx)]
 
             # Get first frame from start_items
             if len(episode_data["start_items"]) == 0:
@@ -462,6 +611,7 @@ class WanEnv(BaseWorldEnv):
         # Reshape to [num_envs, 3, 1, condition_frame_length, H, W] for compatibility
         # [8, 3, 1, 5, 256, 256]
         self.current_obs = stacked_imgs.unsqueeze(2).to(self.device)
+        self.latest_generated_frames = None
         self.condition_action = torch.stack(condition_actions, dim=0).to(self.device)
 
         num_envs, c, v, t, h, w = self.current_obs.shape
@@ -500,7 +650,14 @@ class WanEnv(BaseWorldEnv):
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
-        infos = {}
+        infos = {
+            "episode_indices": episode_indices,
+            "subtask_ids": subtask_ids,
+        }
+        if self.use_subtasks:
+            infos["subtask_names"] = [
+                self.subtask_names[int(subtask_id)] for subtask_id in subtask_ids
+            ]
 
         return extracted_obs, infos
 
@@ -508,82 +665,133 @@ class WanEnv(BaseWorldEnv):
     def step(self, actions=None, auto_reset=True):
         raise NotImplementedError("step in Wan Env is not impl, use chunk_step instead")
 
+    def _reward_model_cfg_for_subtask(self, subtask_id=None):
+        if self.use_subtasks:
+            if subtask_id is None:
+                raise ValueError("subtask_id is required when subtasks are enabled")
+            return self.subtask_reward_model_cfgs[int(subtask_id)]
+        return self.cfg.reward_model
+
+    def _reward_model_for_subtask(self, subtask_id=None):
+        if self.use_subtasks:
+            if subtask_id is None:
+                raise ValueError("subtask_id is required when subtasks are enabled")
+            return self.reward_models[int(subtask_id)]
+        return self.reward_model
+
+    def _infer_rewards_for_batch(
+        self, extract_chunk_obs, reward_model, reward_model_cfg, task_descriptions
+    ):
+        batch_size = extract_chunk_obs.shape[0]
+        _batch, _time, _c, v, h, w = extract_chunk_obs.shape
+
+        if reward_model_cfg.type == "ResnetRewModel":
+            extract_chunk_obs = extract_chunk_obs[
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [batch, wan_predict_frames, 3, v, h, w]
+            extract_chunk_obs = extract_chunk_obs.reshape(
+                batch_size * self.wan_predict_frames, 3, v, h, w
+            )
+            extract_chunk_obs = extract_chunk_obs.squeeze(
+                2
+            )  # [batch * wan_predict_frames, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(
+                extract_chunk_obs, reward_model_cfg
+            )
+            extract_chunk_obs = extract_chunk_obs.to(self.device)
+
+            rewards = reward_model.predict_rew(extract_chunk_obs)
+            rewards = rewards.reshape(batch_size, self.wan_predict_frames)
+        elif reward_model_cfg.type == "ResNetRewardModel":
+            extract_chunk_obs = extract_chunk_obs[
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [batch, wan_predict_frames, 3, v, h, w]
+            extract_chunk_obs = extract_chunk_obs.reshape(
+                batch_size * self.wan_predict_frames, 3, v, h, w
+            )
+            extract_chunk_obs = extract_chunk_obs.squeeze(
+                2
+            )  # [batch * wan_predict_frames, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(
+                extract_chunk_obs, reward_model_cfg
+            )
+            extract_chunk_obs = extract_chunk_obs.to(self.device)
+            extract_chunk_obs = (extract_chunk_obs.clamp(-1.0, 1.0) + 1.0) / 2.0
+
+            rewards = reward_model.compute_reward(
+                {"main_images": extract_chunk_obs}
+            )
+            rewards = rewards.reshape(batch_size, self.wan_predict_frames)
+        elif reward_model_cfg.type == "TaskEmbedResnetRewModel":
+            extract_chunk_obs = extract_chunk_obs[
+                :, -self.wan_predict_frames :, :, :, :, :
+            ]  # [batch, wan_predict_frames, 3, v, h, w]
+            extract_chunk_obs = extract_chunk_obs.reshape(
+                batch_size * self.wan_predict_frames, 3, v, h, w
+            )
+            extract_chunk_obs = extract_chunk_obs.squeeze(
+                2
+            )  # [batch * wan_predict_frames, 3, h, w]
+            extract_chunk_obs = self._select_reward_model_view(
+                extract_chunk_obs, reward_model_cfg
+            )
+            extract_chunk_obs = extract_chunk_obs.to(self.device)
+
+            instructions = []
+            for task_desc in task_descriptions:
+                instructions.extend([task_desc] * self.wan_predict_frames)
+
+            rewards = reward_model.predict_rew(extract_chunk_obs, instructions)
+            rewards = rewards.reshape(batch_size, self.wan_predict_frames)
+        else:
+            raise ValueError(f"Unknown reward model type: {reward_model_cfg.type}")
+
+        return rewards
+
     def _infer_next_chunk_rewards(self):
-        """Predict next reward using the reward model"""
+        """Predict next reward using the reward model."""
         if self.reward_model is None:
             raise ValueError("Reward model is not loaded")
 
-        # Extract chunk observations
-        num_envs, c, v, t, h, w = self.current_obs.shape
+        num_envs, _c, _v, _t, _h, _w = self.current_obs.shape
         extract_chunk_obs = self.current_obs.permute(
             0, 3, 1, 2, 4, 5
         )  # [num_envs, chunk + condition_frame_length, 3, v, h, w]
 
-        if self.cfg.reward_model.type == "ResnetRewModel":
-            extract_chunk_obs = extract_chunk_obs[
-                :, -self.wan_predict_frames :, :, :, :, :
-            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
-            extract_chunk_obs = extract_chunk_obs.reshape(
-                self.num_envs * self.wan_predict_frames, 3, v, h, w
+        if not self.use_subtasks:
+            rewards = self._infer_rewards_for_batch(
+                extract_chunk_obs,
+                self.reward_model,
+                self.cfg.reward_model,
+                self.task_descriptions,
             )
-            extract_chunk_obs = extract_chunk_obs.squeeze(
-                2
-            )  # [num_envs * wan_predict_frames, 3, h, w]
-            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
-            extract_chunk_obs = extract_chunk_obs.to(self.device)
+            return self._expand_wan_rewards_to_chunk(rewards)
 
-            rewards = self.reward_model.predict_rew(extract_chunk_obs)
-            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
-            rewards = self._expand_wan_rewards_to_chunk(rewards)
-        elif self.cfg.reward_model.type == "ResNetRewardModel":
-            extract_chunk_obs = extract_chunk_obs[
-                :, -self.wan_predict_frames :, :, :, :, :
-            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
-            extract_chunk_obs = extract_chunk_obs.reshape(
-                self.num_envs * self.wan_predict_frames, 3, v, h, w
+        rewards = torch.empty(
+            (num_envs, self.wan_predict_frames),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        current_subtask_ids = self.current_subtask_ids.to(self.device)
+        for subtask_id in torch.unique(current_subtask_ids).tolist():
+            env_indices = torch.nonzero(
+                current_subtask_ids == int(subtask_id), as_tuple=False
+            ).flatten()
+            batch_obs = extract_chunk_obs.index_select(0, env_indices)
+            batch_task_descriptions = [
+                self.task_descriptions[int(env_idx)] for env_idx in env_indices.tolist()
+            ]
+            batch_rewards = self._infer_rewards_for_batch(
+                batch_obs,
+                self._reward_model_for_subtask(subtask_id),
+                self._reward_model_cfg_for_subtask(subtask_id),
+                batch_task_descriptions,
             )
-            extract_chunk_obs = extract_chunk_obs.squeeze(
-                2
-            )  # [num_envs * wan_predict_frames, 3, h, w]
-            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
-            extract_chunk_obs = extract_chunk_obs.to(self.device)
-            extract_chunk_obs = (extract_chunk_obs.clamp(-1.0, 1.0) + 1.0) / 2.0
+            rewards.index_copy_(0, env_indices, batch_rewards.to(self.device))
 
-            rewards = self.reward_model.compute_reward(
-                {"main_images": extract_chunk_obs}
-            )
-            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
-            rewards = self._expand_wan_rewards_to_chunk(rewards)
-        elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
-            extract_chunk_obs = extract_chunk_obs[
-                :, -self.wan_predict_frames :, :, :, :, :
-            ]  # [num_envs, wan_predict_frames, 3, v, h, w]
-            extract_chunk_obs = extract_chunk_obs.reshape(
-                self.num_envs * self.wan_predict_frames, 3, v, h, w
-            )
-            extract_chunk_obs = extract_chunk_obs.squeeze(
-                2
-            )  # [num_envs * wan_predict_frames, 3, h, w]
-            extract_chunk_obs = self._select_reward_model_view(extract_chunk_obs)
-            extract_chunk_obs = extract_chunk_obs.to(self.device)
+        return self._expand_wan_rewards_to_chunk(rewards)
 
-            # Prepare instructions for each frame in the chunk
-            # Each environment has one task description, repeat it for each frame in the chunk
-            instructions = []
-            for env_idx in range(self.num_envs):
-                task_desc = self.task_descriptions[env_idx]
-                instructions.extend([task_desc] * self.wan_predict_frames)
-
-            # Predict rewards with instruction conditioning
-            rewards = self.reward_model.predict_rew(extract_chunk_obs, instructions)
-            rewards = rewards.reshape(self.num_envs, self.wan_predict_frames)
-            rewards = self._expand_wan_rewards_to_chunk(rewards)
-        else:
-            raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
-
-        return rewards
-
-    def _select_reward_model_view(self, obs):
+    def _select_reward_model_view(self, obs, reward_model_cfg):
         """Prepare full-frame reward model input while removing only bottom padding."""
         if self.image_layout == "vertical_3view_padded_bottom":
             valid_height = self.view_height * self.num_views
@@ -593,9 +801,9 @@ class WanEnv(BaseWorldEnv):
                     f"need at least {valid_height}"
                 )
             obs = obs[:, :, :valid_height, :]
-        return self._resize_reward_model_input(obs)
+        return self._resize_reward_model_input(obs, reward_model_cfg)
 
-    def _resize_reward_model_input(self, obs):
+    def _resize_reward_model_input(self, obs, reward_model_cfg):
         """Optionally resize reward model input while preserving BCHW layout."""
         if obs.ndim != 4:
             raise ValueError(
@@ -608,7 +816,7 @@ class WanEnv(BaseWorldEnv):
                 f"got shape {tuple(obs.shape)}"
             )
 
-        resize_cfg = self.cfg.reward_model.get("resize", {})
+        resize_cfg = reward_model_cfg.get("resize", {})
         if not resize_cfg or not resize_cfg.get("enabled", False):
             return obs
 
@@ -801,6 +1009,7 @@ class WanEnv(BaseWorldEnv):
 
         # Update current observation: append new generated frames to the time dimension
         self.current_obs = torch.cat([self.current_obs, x_samples], dim=3)
+        self.latest_generated_frames = x_samples.detach()
 
         max_frames = self.condition_frame_length + self.wan_predict_frames
         if self.current_obs.shape[3] > max_frames:
@@ -886,34 +1095,41 @@ class WanEnv(BaseWorldEnv):
 
     def capture_image(self):
         """Return full 3-view frames for video recording."""
-        b, _c, _v, _t, _h, _w = self.current_obs.shape
+        video_obs = (
+            self.latest_generated_frames
+            if self.latest_generated_frames is not None
+            else self.current_obs[:, :, :, -1:, :, :]
+        )
+        b, _c, _v, _t, _h, _w = video_obs.shape
         if b != self.num_envs:
             raise ValueError(
-                f"Unexpected current_obs shape: {self.current_obs.shape}, "
+                f"Unexpected video obs shape: {video_obs.shape}, "
                 f"expected first dim {self.num_envs}"
             )
 
-        last_frame = self.current_obs[:, :, 0, -1, :, :]
-        full_image = last_frame.permute(0, 2, 3, 1)
+        full_image = video_obs[:, :, 0].permute(0, 2, 3, 4, 1)
         full_image = (full_image + 1.0) / 2.0 * 255.0
         full_image = torch.clamp(full_image, 0, 255)
 
-        if full_image.shape[1:3] != self.image_size:
-            full_image = full_image.permute(0, 3, 1, 2)
+        if full_image.shape[2:4] != self.image_size:
+            b, t, h, w, c = full_image.shape
+            full_image = full_image.reshape(b * t, h, w, c).permute(0, 3, 1, 2)
             full_image = F.interpolate(
                 full_image, size=self.image_size, mode="bilinear", align_corners=False
             )
-            full_image = full_image.permute(0, 2, 3, 1)
+            full_image = full_image.permute(0, 2, 3, 1).reshape(
+                b, t, self.image_size[0], self.image_size[1], c
+            )
 
         full_image = full_image.to(torch.uint8)
         if self.image_layout == "vertical_3view_padded_bottom":
             valid_height = self.view_height * self.num_views
-            if full_image.shape[1] < valid_height:
+            if full_image.shape[2] < valid_height:
                 raise ValueError(
-                    f"Cannot capture padded 3-view image with height {full_image.shape[1]}; "
+                    f"Cannot capture padded 3-view image with height {full_image.shape[2]}; "
                     f"need at least {valid_height}"
                 )
-            full_image = full_image[:, :valid_height, :, :]
+            full_image = full_image[:, :, :valid_height, :, :]
 
         return full_image
 
@@ -1040,13 +1256,21 @@ class WanEnv(BaseWorldEnv):
             return
         self.pipe.vae = self.pipe.vae.to("cpu")
         self.pipe.dit = self.pipe.dit.to("cpu")
-        self.reward_model = self.reward_model.to("cpu")
+        if self.use_subtasks:
+            self.reward_models = [model.to("cpu") for model in self.reward_models]
+            self.reward_model = self.reward_models[0]
+        else:
+            self.reward_model = self.reward_model.to("cpu")
         self.current_obs = recursive_to_device(self.current_obs, "cpu")
+        if self.latest_generated_frames is not None:
+            self.latest_generated_frames = self.latest_generated_frames.cpu()
         if self.condition_latents is not None:
             self.condition_latents = self.condition_latents.cpu()
         self.state_proxy = self.state_proxy.cpu()
         self.prev_step_reward = self.prev_step_reward.cpu()
         self.reset_state_ids = self.reset_state_ids.cpu()
+        self.reset_subtask_ids = self.reset_subtask_ids.cpu()
+        self.current_subtask_ids = self.current_subtask_ids.cpu()
         if self.record_metrics:
             self.success_once = self.success_once.cpu()
             self.returns = self.returns.cpu()
@@ -1059,13 +1283,21 @@ class WanEnv(BaseWorldEnv):
             return
         self.pipe.dit = self.pipe.dit.to(self.device)
         self.pipe.vae = self.pipe.vae.to(self.device)
-        self.reward_model = self.reward_model.to(self.device)
+        if self.use_subtasks:
+            self.reward_models = [model.to(self.device) for model in self.reward_models]
+            self.reward_model = self.reward_models[0]
+        else:
+            self.reward_model = self.reward_model.to(self.device)
         self.current_obs = recursive_to_device(self.current_obs, self.device)
+        if self.latest_generated_frames is not None:
+            self.latest_generated_frames = self.latest_generated_frames.to(self.device)
         if self.condition_latents is not None:
             self.condition_latents = self.condition_latents.to(self.device)
         self.state_proxy = self.state_proxy.to(self.device)
         self.prev_step_reward = self.prev_step_reward.to(self.device)
         self.reset_state_ids = self.reset_state_ids.to(self.device)
+        self.reset_subtask_ids = self.reset_subtask_ids.to(self.device)
+        self.current_subtask_ids = self.current_subtask_ids.to(self.device)
         if self.record_metrics:
             self.success_once = self.success_once.to(self.device)
             self.returns = self.returns.to(self.device)
@@ -1080,6 +1312,9 @@ class WanEnv(BaseWorldEnv):
             "condition_latents": self.condition_latents.cpu()
             if self.condition_latents is not None
             else None,
+            "latest_generated_frames": self.latest_generated_frames.cpu()
+            if self.latest_generated_frames is not None
+            else None,
             "task_descriptions": self.task_descriptions,
             "init_ee_poses": self.init_ee_poses,
             "state_proxy": self.state_proxy.cpu(),
@@ -1087,6 +1322,8 @@ class WanEnv(BaseWorldEnv):
             "prev_step_reward": self.prev_step_reward.cpu(),
             "_is_start": self._is_start,
             "reset_state_ids": self.reset_state_ids.cpu(),
+            "reset_subtask_ids": self.reset_subtask_ids.cpu(),
+            "current_subtask_ids": self.current_subtask_ids.cpu(),
             "generator_state": self._generator.get_state(),
         }
         if self.record_metrics:
@@ -1100,6 +1337,61 @@ class WanEnv(BaseWorldEnv):
         buffer = io.BytesIO()
         torch.save(env_state, buffer)
         return buffer.getvalue()
+
+    def load_state(self, state_buffer: bytes):
+        """Restore runtime state from a buffer produced by get_state."""
+        state = torch.load(
+            io.BytesIO(state_buffer), map_location="cpu", weights_only=False
+        )
+        self.current_obs = (
+            recursive_to_device(state["current_obs"], self.device)
+            if state["current_obs"] is not None
+            else None
+        )
+        self.condition_latents = (
+            state["condition_latents"].to(self.device)
+            if state["condition_latents"] is not None
+            else None
+        )
+        self.latest_generated_frames = (
+            state.get("latest_generated_frames").to(self.device)
+            if state.get("latest_generated_frames") is not None
+            else None
+        )
+        self.task_descriptions = state["task_descriptions"]
+        self.init_ee_poses = state["init_ee_poses"]
+        self.state_proxy = state["state_proxy"].to(self.device)
+        self.elapsed_steps = state["elapsed_steps"]
+        self.prev_step_reward = state["prev_step_reward"].to(self.device)
+        self._is_start = state["_is_start"]
+        self.reset_state_ids = state["reset_state_ids"].to(self.device)
+        self.reset_subtask_ids = state.get(
+            "reset_subtask_ids",
+            torch.zeros_like(self.reset_state_ids, dtype=torch.long),
+        ).to(self.device)
+        self.current_subtask_ids = state.get(
+            "current_subtask_ids",
+            torch.zeros(self.num_envs, dtype=torch.long),
+        ).to(self.device)
+        self._generator.set_state(state["generator_state"])
+
+        if self.current_obs is not None:
+            _b, _c, _v, t, _h, _w = self.current_obs.shape
+            condition_start = max(0, t - self.condition_frame_length)
+            for env_idx in range(self.num_envs):
+                frames = [
+                    self.current_obs[env_idx, :, 0, t_idx : t_idx + 1, :, :]
+                    for t_idx in range(condition_start, t)
+                ]
+                if len(frames) < self.condition_frame_length and len(frames) > 0:
+                    frames = [frames[0]] * (
+                        self.condition_frame_length - len(frames)
+                    ) + frames
+                self.image_queue[env_idx] = frames[: self.condition_frame_length]
+
+        if self.record_metrics and "success_once" in state:
+            self.success_once = state["success_once"].to(self.device)
+            self.returns = state["returns"].to(self.device)
 
 
 # PYTHONPATH="/mnt/project_rlinf/jzn/workspace/release/DiffSynth-Studio:$PYTHONPATH" python -m rlinf.envs.world_model.world_model_wan_env

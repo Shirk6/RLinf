@@ -144,7 +144,7 @@ class RecordVideo(gym.Wrapper):
                         continue
                     batches = self._split_image_source(image_src)
                     if batches:
-                        frames.append(batches[0])
+                        frames.extend(batches)
                 return frames
             images = []
             for item in obs:

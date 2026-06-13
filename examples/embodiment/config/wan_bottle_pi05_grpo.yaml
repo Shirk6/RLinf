@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "wan_tower_pi05_grpo"
+    experiment_name: "wan_bottle_pi05_grpo"
     logger_backends: ["wandb"]
 
   max_epochs: 1000
@@ -33,7 +33,7 @@ runner:
   val_check_interval: -1
   save_interval: 10
 
-  resume_dir: '/project/peilab/srk/rss_2026_ws/RLinf/logs/20260611-01:35:26-wan_tower_pi05_grpo/wan_tower_pi05_grpo/checkpoints/global_step_20'
+  resume_dir: null
   ckpt_path: null
 
 algorithm:
@@ -41,7 +41,7 @@ algorithm:
   kl_penalty: kl
   group_size: 8
   reward_coef: 1.0
-  rollout_epoch: 8
+  rollout_epoch: 1
   eval_rollout_epoch: 1
 
   reward_type: chunk_level
@@ -85,17 +85,17 @@ env:
   group_name: "EnvGroup"
 
   train:
-    total_num_envs: 64
+    total_num_envs: 512
     group_size: ${algorithm.group_size}
     max_episode_steps: 3072
     max_steps_per_rollout_epoch: 3072
     
     reward_coef: ${algorithm.reward_coef}
-    wan_wm_hf_ckpt_path: "/project/peilab/srk/rss_2026_ws/models/wan-tower"
+    wan_wm_hf_ckpt_path: "models/wan-bottle"
     enable_offload: True
     num_inference_steps: 5
     use_rel_reward: False
-    success_reward_threshold: 0.8
+    success_reward_threshold: 0.9
     reward_model:
       resize:
         enabled: True
@@ -136,7 +136,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/project/peilab/srk/rss_2026_ws/Baseline-checkpoints/pi05_tower-of-hanoi-game_pytorch"
+    model_path: "models/pi05_seal-water-bottle-cap_weighted_bc_pytorch"
     precision: ${actor.model.precision}
 
 actor:
@@ -148,13 +148,13 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "/project/peilab/srk/rss_2026_ws/Baseline-checkpoints/pi05_tower-of-hanoi-game_pytorch"
+    model_path: "models/pi05_seal-water-bottle-cap_weighted_bc_pytorch"
     model_type: "openpi"
     num_action_chunks: 48
     action_dim: 14
     add_value_head: False
     openpi:
-      config_name: "pi05_yam_tower"
+      config_name: "pi05_yam_bottle"
       num_images_in_input: 3
       noise_level: 0.3
       action_chunk: ${actor.model.num_action_chunks}

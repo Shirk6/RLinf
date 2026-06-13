@@ -314,7 +314,23 @@ _CONFIGS = [
         data=DualYamDataConfig(
             repo_id="tower-of-hanoi-game/expert-data",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="assets/v21/rss2026_multitask"),
+            assets=AssetsConfig(asset_id="assets/v21/tower-of-hanoi-game"),
+            use_delta_joint_actions=True,
+            adapt_to_pi=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_yam_tower_160000",
+        num_train_steps=200_000,
+    ),
+    TrainConfig(
+        name="pi05_yam_bottle",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=DualYamDataConfig(
+            repo_id="seal-water-bottle-cap/expert-data",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="assets/seal-water-bottle-cap/weighted-bc"),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),
@@ -330,7 +346,7 @@ _CONFIGS = [
         data=DualYamDataConfig(
             repo_id="insert-mouse-battery/expert-data",
             base_config=DataConfig(prompt_from_task=True),
-            assets=AssetsConfig(asset_id="assets/insert-mouse-battery/weighted-bc"),
+            assets=AssetsConfig(asset_id="assets/v21/insert-mouse-battery"),
             use_delta_joint_actions=True,
             adapt_to_pi=True,
         ),

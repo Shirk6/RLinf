@@ -22,7 +22,7 @@ use_ordered_reset_state_ids: False
 specific_reset_id: null
 
 video_cfg:
-  save_video: True
+  save_video: False
   info_on_video: True
   video_base_dir: ${runner.logger.log_path}/video/train
 
@@ -39,6 +39,11 @@ enable_kir: False
 use_latent_condition_cache: True
 initial_image_path: ${env.train.wan_wm_hf_ckpt_path}/dataset/
 
+subtasks:
+  enabled: False
+  sampling: grouped_random
+  items: []
+
 num_inference_steps: 5
 action_dim: 14
 chunk: 48
@@ -54,7 +59,7 @@ num_frames: 13
 
 reward_model:
   type: ResNetRewardModel
-  from_pretrained: ${env.train.wan_wm_hf_ckpt_path}/resnet_rm.pth
+  from_pretrained: ${env.train.wan_wm_hf_ckpt_path}/full_weights.pt
   pretrained: False
   arch: resnet18
   hidden_dim: 256

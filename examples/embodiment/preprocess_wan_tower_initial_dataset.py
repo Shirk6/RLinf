@@ -3,12 +3,16 @@
 
 The Wan Tower environment reads one ``.npy`` trajectory per reset state through
 ``NpyTrajectoryDatasetWrapper``.  This script converts the Challenge phase-1
-Tower of Hanoi expert dataset into that format:
+Tower of Hanoi expert dataset into that format and writes three initial-state
+sets:
 
-* first 25 source frames are considered;
-* condition images use source frame indices [0, 6, 12, 18, 24];
-* target condition actions use [5, 11, 17, 23], matching Wan's stride-6
-  action downsampling;
+* ``video_start`` starts from source frame 0;
+* ``stage1`` starts from the manually labeled stage_1 frame;
+* ``stage2`` starts from the manually labeled stage_2 frame;
+* each trajectory keeps the whole episode's first frame and contains 5 frames
+  total. ``video_start`` uses [0, 6, 12, 18, 24]; stage trajectories use
+  [0, start, start + 6, start + 12, start + 18];
+* actions are sampled at the same source indices as frames;
 * the three camera views are stacked vertically as high, left wrist, right
   wrist, then padded from 540x320 to 544x320.
 """
@@ -34,14 +38,25 @@ CAMERA_KEYS = (
     "observation.images.cam_left_wrist",
     "observation.images.cam_right_wrist",
 )
-DEFAULT_FRAME_INDICES = (0, 5, 11, 17, 23)
-DEFAULT_ACTION_INDICES = (0, 5, 11, 17, 23)
+DEFAULT_LABELS_PATH = Path(
+    "Challenge-phase1-dataset/tower-of-hanoi-game/manual_stage_labels/labels_merged.json"
+)
+INITIAL_STATE_SPECS = (
+    ("video_start", None),
+    ("stage1", "stage_1"),
+    ("stage2", "stage_2"),
+)
+NUM_CONDITION_FRAMES = 5
+FRAME_STRIDE = 6
 TASK = "tower-of-hanoi-game"
 
 
 @dataclass(frozen=True)
 class EpisodeJob:
     episode_index: int
+    episode_id: str
+    initial_state: str
+    initial_frame_index: int
     length: int
     source_root: Path
     output_dir: Path
@@ -69,20 +84,16 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=Path("/project/peilab/srk/rss_2026_ws/models/wan-tower/dataset"),
-        help="Output directory consumed by env.train.initial_image_path.",
-    )
-    parser.add_argument(
-        "--frame-indices",
-        default=",".join(map(str, DEFAULT_FRAME_INDICES)),
-        help="Comma-separated source frame indices used as condition images.",
-    )
-    parser.add_argument(
-        "--action-indices",
-        default=",".join(map(str, DEFAULT_ACTION_INDICES)),
         help=(
-            "Comma-separated source action indices for the saved frames. "
-            "The first one is unused by Wan reset; target items use the last four."
+            "Base output directory. The script writes video_start/, stage1/, "
+            "and stage2/ subdirectories under this path."
         ),
+    )
+    parser.add_argument(
+        "--labels-path",
+        type=Path,
+        default=DEFAULT_LABELS_PATH,
+        help="Merged manual stage labels JSON used for stage1/stage2 starts.",
     )
     parser.add_argument("--view-height", type=int, default=180)
     parser.add_argument("--width", type=int, default=320)
@@ -102,13 +113,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_int_tuple(value: str) -> tuple[int, ...]:
-    items = tuple(int(item.strip()) for item in value.split(",") if item.strip())
-    if not items:
-        raise ValueError("Expected at least one integer")
-    return items
-
-
 def load_jsonl(path: Path) -> list[dict]:
     records = []
     with path.open("r", encoding="utf-8") as f:
@@ -116,6 +120,28 @@ def load_jsonl(path: Path) -> list[dict]:
             line = line.strip()
             if line:
                 records.append(json.loads(line))
+    return records
+
+
+def load_stage_labels(labels_path: Path, source_name: str) -> list[dict]:
+    data = json.loads(labels_path.read_text(encoding="utf-8-sig"))
+    raw_labels = data.get("labels", data)
+    if not isinstance(raw_labels, dict):
+        raise ValueError(f"{labels_path} does not contain a labels object")
+
+    records = []
+    for episode_id, record in raw_labels.items():
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("source")) != source_name:
+            continue
+        stages = record.get("stages") or {}
+        if stages.get("stage_1") is None or stages.get("stage_2") is None:
+            continue
+        labeled_episode_id = str(record.get("episode_id") or episode_id)
+        records.append({**record, "episode_id": labeled_episode_id})
+
+    records.sort(key=lambda item: int(item["episode_index"]))
     return records
 
 
@@ -153,6 +179,14 @@ def build_ffmpeg_filter(frame_indices: tuple[int, ...]) -> str:
     stacked = "".join(f"[v{stream_idx}]" for stream_idx in range(len(CAMERA_KEYS)))
     filter_parts.append(f"{stacked}vstack=inputs={len(CAMERA_KEYS)},format=rgb24[out]")
     return ";".join(filter_parts)
+
+
+def sampled_indices(start_frame: int) -> tuple[int, ...]:
+    if start_frame == 0:
+        return tuple(i * FRAME_STRIDE for i in range(NUM_CONDITION_FRAMES))
+    return (0,) + tuple(
+        start_frame + i * FRAME_STRIDE for i in range(NUM_CONDITION_FRAMES - 1)
+    )
 
 
 def extract_stacked_frames(job: EpisodeJob) -> np.ndarray:
@@ -248,6 +282,9 @@ def convert_episode(job: EpisodeJob) -> tuple[int, str]:
             "instruction": TASK,
             "task": TASK,
             "episode_index": np.int64(job.episode_index),
+            "episode_id": job.episode_id,
+            "initial_state": job.initial_state,
+            "initial_frame_index": np.int64(job.initial_frame_index),
             "source_frame_index": np.int64(job.frame_indices[i]),
             "source_action_index": np.int64(job.action_indices[i]),
         }
@@ -260,43 +297,92 @@ def convert_episode(job: EpisodeJob) -> tuple[int, str]:
 
 def build_jobs(args: argparse.Namespace) -> list[EpisodeJob]:
     source_root = args.source_root.resolve()
-    output_dir = args.output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_base_dir = args.output_dir.resolve()
+    output_base_dir.mkdir(parents=True, exist_ok=True)
+    labels_path = args.labels_path.resolve()
 
     info_path = source_root / "meta" / "info.json"
     episodes_path = source_root / "meta" / "episodes.jsonl"
     info = json.loads(info_path.read_text(encoding="utf-8"))
     chunk_size = int(info.get("chunks_size", 1000))
 
-    frame_indices = parse_int_tuple(args.frame_indices)
-    action_indices = parse_int_tuple(args.action_indices)
-    if len(frame_indices) != 5:
-        raise ValueError(f"Wan Tower expects 5 condition frame indices, got {frame_indices}")
-    if len(action_indices) != len(frame_indices):
-        raise ValueError("action-indices must have the same length as frame-indices")
-
-    episodes = load_jsonl(episodes_path)
+    episodes_by_index = {
+        int(record["episode_index"]): record for record in load_jsonl(episodes_path)
+    }
+    label_records = load_stage_labels(labels_path, source_root.name)
     if args.max_episodes is not None:
-        episodes = episodes[: args.max_episodes]
+        label_records = label_records[: args.max_episodes]
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    return [
-        EpisodeJob(
-            episode_index=int(record["episode_index"]),
-            length=int(record["length"]),
-            source_root=source_root,
-            output_dir=output_dir,
-            frame_indices=frame_indices,
-            action_indices=action_indices,
-            view_height=args.view_height,
-            width=args.width,
-            padding_bottom=args.padding_bottom,
-            chunk_size=chunk_size,
-            overwrite=args.overwrite,
-            ffmpeg_exe=ffmpeg_exe,
+    jobs = []
+    skipped_missing_episode = 0
+    skipped_too_short = 0
+
+    for label_record in label_records:
+        episode_index = int(label_record["episode_index"])
+        episode_record = episodes_by_index.get(episode_index)
+        if episode_record is None:
+            skipped_missing_episode += 1
+            continue
+
+        length = int(episode_record["length"])
+        stages = label_record.get("stages") or {}
+        for initial_state, stage_key in INITIAL_STATE_SPECS:
+            if stage_key is None:
+                start_frame = 0
+            else:
+                stage_value = stages.get(stage_key)
+                if stage_value is None:
+                    continue
+                start_frame = int(stage_value["frame"])
+
+            frame_indices = sampled_indices(start_frame)
+            if frame_indices[-1] >= length:
+                skipped_too_short += 1
+                print(
+                    f"Warning: skip episode {episode_index:06d} {initial_state}; "
+                    f"need frame {frame_indices[-1]}, length is {length}",
+                    flush=True,
+                )
+                continue
+
+            output_dir = output_base_dir / initial_state
+            output_dir.mkdir(parents=True, exist_ok=True)
+            jobs.append(
+                EpisodeJob(
+                    episode_index=episode_index,
+                    episode_id=str(label_record["episode_id"]),
+                    initial_state=initial_state,
+                    initial_frame_index=start_frame,
+                    length=length,
+                    source_root=source_root,
+                    output_dir=output_dir,
+                    frame_indices=frame_indices,
+                    action_indices=frame_indices,
+                    view_height=args.view_height,
+                    width=args.width,
+                    padding_bottom=args.padding_bottom,
+                    chunk_size=chunk_size,
+                    overwrite=args.overwrite,
+                    ffmpeg_exe=ffmpeg_exe,
+                )
+            )
+
+    if not jobs:
+        raise ValueError(
+            f"No jobs built from labels_path={labels_path} and source={source_root.name}"
         )
-        for record in episodes
-    ]
+    if skipped_missing_episode:
+        print(
+            f"Warning: skipped {skipped_missing_episode} labels with no matching episode metadata",
+            flush=True,
+        )
+    if skipped_too_short:
+        print(
+            f"Warning: skipped {skipped_too_short} initial states that were too close to episode end",
+            flush=True,
+        )
+    return jobs
 
 
 def run_jobs(jobs: Iterable[EpisodeJob], workers: int) -> dict[str, int]:

@@ -79,6 +79,20 @@ def prepare_actions_for_libero(
     return chunk_actions
 
 
+def prepare_actions_for_piper(
+    raw_chunk_actions,
+) -> np.ndarray:
+    """Prepare policy actions for the DreamDojo piper world model.
+
+    The piper model consumes a 14-dim dual-arm joint-position delta per frame
+    (placed into slots [169:183] of the 384-wide cosmos action vector by the
+    env). The policy is expected to already emit this 14-dim action, so this is
+    a pass-through that only guarantees a float32 numpy array. Add scaling /
+    convention conversion here if the policy's action space differs.
+    """
+    return np.asarray(raw_chunk_actions, dtype=np.float32)
+
+
 def prepare_actions_for_isaaclab(
     raw_chunk_actions,
     model_type,
@@ -288,6 +302,18 @@ def prepare_actions(
     elif env_type == SupportedEnvType.OPENSORAWM or env_type == SupportedEnvType.WANWM:
         # TODO: Implement prepare_actions_for_opensora_wm
         if wm_env_type == "libero":
+            chunk_actions = prepare_actions_for_libero(
+                raw_chunk_actions=raw_chunk_actions,
+                model_type=model_type,
+            )
+        else:
+            raise NotImplementedError(f"Env type {wm_env_type} not implemented")
+    elif env_type == SupportedEnvType.DREAMDOJOWM:
+        if wm_env_type == "piper":
+            chunk_actions = prepare_actions_for_piper(
+                raw_chunk_actions=raw_chunk_actions,
+            )
+        elif wm_env_type == "libero":
             chunk_actions = prepare_actions_for_libero(
                 raw_chunk_actions=raw_chunk_actions,
                 model_type=model_type,

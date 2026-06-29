@@ -1,0 +1,26 @@
+# RLinf runtime deps MISSING from the cosmos-native venv, layered on top.
+# The cosmos env already provides (and the frozen constraint keeps): accelerate,
+# scipy, einops, huggingface_hub, hydra-core, omegaconf, wandb, numpy, fsspec,
+# torch 2.7+cu128, etc. We only add what cosmos lacks.
+#
+# Deliberately NOT listed:
+#  - torch/torchvision/numpy : cosmos-pinned (torch 2.7+cu128).
+#  - torchdata, liger_kernel : their releases pin torch<=2.6 (conflict with 2.7);
+#    only used by RLinf's SFT/reasoning paths, not the embodied world-model RL path.
+#  - datasets : its releases cap fsspec<=2025.3 (conflict with cosmos fsspec 2025.10);
+#    the HF datasets lib is not used by the world-model env rollout path.
+ray[default]>=2.47.0
+tensorboard
+swanlab>=0.6.11
+nvitop
+debugpy
+icmplib
+sortedcontainers
+pybind11
+ninja
+# groot_dreams runtime dep not in the cosmos lock (used by its MANO dataset path).
+h5py
+# NOTE: the lightning stack (lightning/pytorch-lightning/lightning-utilities/
+# torchmetrics/piq), required by cosmos's external/lam import, is installed
+# separately with --no-deps in install.sh -- lightning==2.6.5 pins torch==2.6 in
+# its metadata and would otherwise conflict with cosmos's torch 2.7.

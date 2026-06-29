@@ -1,0 +1,62 @@
+env_type: dreamdojo_wm
+task_suite_name: piper_insert_mouse_battery
+wm_env_type: piper
+
+total_num_envs: null
+
+auto_reset: False
+ignore_terminations: False
+max_steps_per_rollout_epoch: 240
+max_episode_steps: 240 # max episode steps for truncation
+
+use_rel_reward: False   # reward model is a stub (zeros) for now
+reward_coef: 1.0
+
+is_eval: False
+
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: True
+use_ordered_reset_state_ids: False
+specific_reset_id: null
+
+video_cfg:
+  save_video: True
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+enable_offload: False
+
+###  ------------------ DreamDojo (Cosmos-Predict2) params ------------------
+
+# Path to the DreamDojo repo (added to sys.path so `cosmos_predict2` imports).
+dreamdojo_repo_path: /mnt/afs-h200/yuyangcheng/data/Shirk6_DreamDojo_piper
+
+# Cosmos checkpoint dir + experiment registration.
+dreamdojo_ckpt_path: /mnt/afs-h200/yuyangcheng/data/Shirk6_DreamDojo_piper/dreamdojo_logs/dreamdojo/exp1201/piper_vertical_1440_640_fps10/checkpoints/iter_000010000/model
+experiment: dreamdojo_2b_1440_640_piper
+config_file: cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py
+
+# KIR (multi-condition-frame) trick is WAN-specific; piper uses 1 condition frame.
+enable_kir: False
+
+# Reset initial frames: npy trajectories (export with scripts/convert_piper_to_initial_npy.py).
+initial_image_path: /mnt/afs-h200/yuyangcheng/data/piper_initial_frames/
+
+# Generation hyperparameters.
+chunk: 12                       # frames predicted per chunk_step (= num_action_per_chunk)
+num_inference_steps: 35         # diffusion steps; lower for faster (smoke) rollout
+guidance: 0
+height: 1440                    # native generation height
+width: 640                      # native generation width
+num_latent_conditional_frames: 1
+image_size: [256, 256]          # image resolution returned to the policy
+
+# Action layout inside the 384-wide cosmos action vector (piper -> [169:183]).
+model_action_dim: 384
+action_slot: [169, 183]
+
+# Reward model placeholder (handled separately; env currently returns zeros).
+reward_model:
+  type: null
+  from_pretrained: null

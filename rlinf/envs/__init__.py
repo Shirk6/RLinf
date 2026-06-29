@@ -29,6 +29,7 @@ class SupportedEnvType(Enum):
     HABITAT = "habitat"
     OPENSORAWM = "opensora_wm"
     WANWM = "wan_wm"
+    DREAMDOJOWM = "dreamdojo_wm"
     GENESIS = "genesis"
     EMBODICHAIN = "embodichain"
     ROBOVERSE = "roboverse"
@@ -122,6 +123,10 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.world_model.world_model_wan_env import WanEnv
 
         return WanEnv
+    elif env_type == SupportedEnvType.DREAMDOJOWM:
+        from rlinf.envs.world_model.world_model_dreamdojo_env import DreamDojoEnv
+
+        return DreamDojoEnv
     elif env_type == SupportedEnvType.EMBODICHAIN:
         from rlinf.envs.embodichain.embodichain_env import EmbodiChainEnv
 

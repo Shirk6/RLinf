@@ -75,7 +75,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "dreamdojo" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 #=======================Utility Functions=======================
 
@@ -1076,6 +1076,12 @@ install_openvla_oft_model() {
             install_flash_attn
             uv pip install git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git
             ;;
+        dreamdojo)
+            # DreamDojo builds its own cosmos-native venv (torch 2.7) and layers
+            # RLinf on top; it does NOT use create_and_sync_venv (which would pin
+            # torch 2.6 via RLinf's embodied override). See install_dreamdojo_world_model.
+            install_dreamdojo_world_model
+            ;;
         liberopro)
             create_and_sync_venv
             install_common_embodied_deps
@@ -1942,6 +1948,99 @@ install_wan_world_model() {
     wan_dir=$(clone_or_reuse_repo WAN_PATH "$VENV_DIR/wan" https://github.com/RLinf/diffsynth-studio.git)
     uv pip install -e "$wan_dir"
     uv pip install -r $SCRIPT_DIR/embodied/models/wan.txt
+}
+
+install_dreamdojo_world_model() {
+    # DreamDojo (Cosmos-Predict2 action-conditioned world model) requires
+    # torch 2.7 from NVIDIA's cosmos package index and only resolves cleanly via
+    # `uv sync` inside its own uv workspace. That conflicts with RLinf's embodied
+    # torch==2.6 override, so a shared embodied venv is impossible. Instead we
+    # build cosmos's native venv at $VENV_DIR (via UV_PROJECT_ENVIRONMENT) and
+    # layer RLinf + ray on top — RLinf's base deps only require torch>=2.5, so
+    # they coexist with cosmos's torch 2.7.
+    #
+    # Set DREAMDOJO_PATH to reuse an existing DreamDojo checkout (its own .venv is
+    # left untouched; we create a separate venv at $VENV_DIR).
+    local repo_root dreamdojo_dir
+    repo_root="$(realpath "$SCRIPT_DIR/..")"
+    # Resolve VENV_DIR to an absolute path before any `cd` (UV_PROJECT_ENVIRONMENT
+    # and the clone dir below must not be interpreted relative to dreamdojo_dir).
+    VENV_DIR="$(realpath -m "$VENV_DIR")"
+    dreamdojo_dir=$(clone_or_reuse_repo DREAMDOJO_PATH "${VENV_DIR}-src/dreamdojo" ${GITHUB_PREFIX}https://github.com/Shirk6/DreamDojo.git)
+
+    # Pin to a known-good revision when we cloned it ourselves (skip for a
+    # user-provided DREAMDOJO_PATH, which the user manages).
+    if [ -z "$(printenv DREAMDOJO_PATH 2>/dev/null || true)" ]; then
+        git -C "$dreamdojo_dir" checkout 27aa97b 2>/dev/null || true
+    fi
+
+    install_uv
+
+    # 1) Build the cosmos-native venv (torch 2.7 cu128 + cosmos-oss heavy deps)
+    #    at $VENV_DIR. UV_PROJECT_ENVIRONMENT redirects the workspace venv there
+    #    instead of <dreamdojo_dir>/.venv.
+    ( cd "$dreamdojo_dir" && UV_PROJECT_ENVIRONMENT="$VENV_DIR" uv sync --extra cu128 )
+
+    # Activate it so the shared helpers (uv pip install, install_flash_attn) and
+    # the trailing pynvml cleanup target this venv.
+    # shellcheck disable=SC1090
+    source "$VENV_DIR/bin/activate"
+
+    # 2) cosmos_predict2 + groot_dreams are imported from the repo root via
+    #    PYTHONPATH (matching DreamDojo's own launch scripts), not pip-installed
+    #    (hatch only packages cosmos_predict2, and the cu128 extra is workspace-only).
+    echo "export PYTHONPATH=$dreamdojo_dir:\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
+
+    # Freeze the ENTIRE cosmos env as a constraint so layering RLinf's deps can
+    # only ADD new packages, never change cosmos's pinned versions. Without this,
+    # unpinned deps (accelerate/datasets/...) re-resolve against the torch
+    # 2.7+cu128 pin and uv silently picks dep-free stub versions (e.g.
+    # accelerate==0.0.1) or downgrades, corrupting the cosmos runtime.
+    # Keep only `name==version` lines (drop editable `-e` / `name @ url` entries
+    # that constraint files reject).
+    local cosmos_constraints="$VENV_DIR/.cosmos-constraints.txt"
+    uv pip freeze | grep -E '^[A-Za-z0-9._-]+==' \
+        | grep -viE '^(setuptools|pip|wheel|uv|packaging)==' > "$cosmos_constraints" || true
+
+    # 3) Layer RLinf onto the cosmos venv WITHOUT disturbing torch 2.7 / the
+    #    cu128 flash-attn / accelerate etc. that `uv sync` already installed:
+    #    - install the rlinf package only (`--no-deps`); a plain editable install
+    #      applies RLinf's torch==2.6 override and downgrades torch, which breaks
+    #      the cosmos CUDA wheels (flash-attn / natten / transformer-engine).
+    #    - install RLinf's runtime base deps from dreamdojo.txt, constrained to the
+    #      frozen cosmos env so only genuinely-missing packages (ray/hydra/...) get
+    #      added.
+    uv pip install -e "$repo_root" --no-deps
+    uv pip install --constraint "$cosmos_constraints" -r $SCRIPT_DIR/embodied/models/dreamdojo.txt
+
+    # 3a) cosmos's external/lam import needs the lightning stack. lightning==2.6.5
+    #     pins torch==2.6 in its metadata, so install it (and torch-coupled
+    #     siblings) with --no-deps -- their real runtime deps are already provided
+    #     by the cosmos env. Versions match the reference DreamDojo venv (verified
+    #     to run with torch 2.7).
+    uv pip install --constraint "$cosmos_constraints" --no-deps \
+        lightning==2.6.5 pytorch-lightning==2.6.5 lightning-utilities==0.15.3 \
+        torchmetrics==1.9.0 piq==0.8.0
+
+    # 3b) pytorch3d is required by groot_dreams (rotation transforms) but is not
+    #     in the cosmos lock. Build it from source against torch 2.7 (matches the
+    #     reference DreamDojo setup). Needs nvcc (CUDA_HOME) + ninja (in dreamdojo.txt).
+    CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}" PATH="${CUDA_HOME:-/usr/local/cuda}/bin:$PATH" \
+        uv pip install --constraint "$cosmos_constraints" --no-build-isolation \
+        "git+${GITHUB_PREFIX}https://github.com/facebookresearch/pytorch3d.git@v0.7.9" || \
+        echo "[install.sh] WARNING: pytorch3d build failed; the world-model env needs it (groot_dreams)."
+
+    # NOTE: do NOT call install_flash_attn here -- `uv sync --extra cu128` already
+    # installed flash-attn built for torch 2.7 (cu128.torch27). install_flash_attn
+    # would swap in a torch-2.6 wheel and break the cosmos stack.
+
+    # 4) Placeholder VLA policy for the actor/rollout side. Best-effort: piper
+    #    needs its own 14-dim-action policy, and the world-model env runs without
+    #    it, so a failure here (network, or a dep that can't fit the frozen cosmos
+    #    env) must not fail the whole install.
+    git config --global http.version HTTP/1.1 2>/dev/null || true
+    uv pip install --constraint "$cosmos_constraints" git+${GITHUB_PREFIX}https://github.com/moojink/openvla-oft.git --no-build-isolation || \
+        echo "[install.sh] WARNING: openvla-oft policy install failed; install it later into $VENV_DIR."
 }
 
 install_roboverse_env() {

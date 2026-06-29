@@ -43,6 +43,7 @@ FROM base-image-platform-${PLATFORM} AS base-image-embodied-robotwin
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-opensora
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-frankasim
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-wan
+FROM base-image-platform-${PLATFORM} AS base-image-embodied-dreamdojo
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-libero
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-liberopro
 FROM base-image-platform-${PLATFORM} AS base-image-embodied-liberoplus
@@ -366,6 +367,19 @@ RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLA
 
 # Set default env
 RUN echo "source ${UV_PATH}/openvla-oft/bin/activate" >> ~/.bashrc
+
+##################################################################################################
+# Embodied: DreamDojo (Cosmos-Predict2 world model)
+##################################################################################################
+FROM embodied-common-image AS embodied-dreamdojo-image
+
+# DreamDojo builds a cosmos-native venv (torch 2.7) at ${UV_PATH}/dreamdojo and
+# layers RLinf on top; the openvla-oft policy is installed into that same venv.
+RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv dreamdojo --model openvla-oft --env dreamdojo
+
+# Set default env
+RUN echo "source ${UV_PATH}/dreamdojo/bin/activate" >> ~/.bashrc
+
 
 ##################################################################################################
 # Embodied: FrankaSim

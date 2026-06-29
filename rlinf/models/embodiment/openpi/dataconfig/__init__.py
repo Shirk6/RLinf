@@ -26,6 +26,9 @@ from openpi.training.config import (
     TrainConfig,
 )
 
+from rlinf.models.embodiment.openpi.dataconfig.agilex_dataconfig import (
+    LerobotAgilexDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
     LeRobotBehaviorDataConfig,
 )
@@ -442,6 +445,26 @@ _CONFIGS = [
             assets=AssetsConfig(asset_id="assets/droid"),
         ),
         pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
+    ),
+    TrainConfig(
+        # pi0.5 SFT'd on the piper "insert mouse battery" task. Defaults
+        # (action_horizon=50, action_dim=32) match
+        # huggingface.co/Shirk6/pi05-piper-insert-mouse-battery-run2-30000-pytorch
+        # config.json. Public piper SFTs in kai0 use absolute joints
+        # (use_delta_joint_actions=False); flip if your SFT used deltas.
+        name="pi05_piper",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=50,
+            discrete_state_input=False,
+        ),
+        data=LerobotAgilexDataConfig(
+            repo_id="Shirk6/piper-insert-mouse-battery",  # not loaded at inference
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(assets_dir="checkpoints/torch/pi05_piper/assets"),
+            use_delta_joint_actions=False,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_piper",
     ),
 ]
 

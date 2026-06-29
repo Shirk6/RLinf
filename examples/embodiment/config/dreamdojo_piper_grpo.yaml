@@ -1,17 +1,25 @@
 defaults:
   - env/dreamdojo_piper@env.train
   - env/dreamdojo_piper@env.eval
-  - model/openvla_oft@actor.model
+  - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 # NOTE: This config wires the DreamDojo piper world model into RLinf's embodied
-# GRPO loop. The world-model env side is complete; the *policy* side is a
-# placeholder -- openvla_oft emits 7-dim actions, while piper needs a 14-dim
-# dual-arm joint-delta action. Swap in a piper-capable VLA and set
-# actor.model.num_action_chunks=12 / action_dim=14 before real training.
-# Reward is a zero stub until the piper reward model lands.
+# GRPO loop, with pi0.5 as the policy. For *rollout* the algorithm choice does
+# not matter (PPO vs GRPO only differs in the gradient step). Reward is a zero
+# stub until the piper reward model lands, so any real training is meaningless
+# regardless of algorithm.
+#
+# Before launching rollout:
+# 1. Add an openpi dataconfig "pi05_piper" under
+#    rlinf/models/embodiment/openpi/dataconfig/ that matches piper's obs/action
+#    spec (1 RGB image, 14-dim joint-delta action padded to 32). The SFT'd
+#    pi0.5 (run2/iter30000) was trained with action_horizon=50 and internal
+#    action_dim=32; norm_stats live in the model dir's assets/norm_stats.json.
+# 2. If switching to PPO actor-critic later: set add_value_head=True and flip
+#    algorithm.loss_type=actor_critic + algorithm.adv_type=gae.
 
 hydra:
   run:
@@ -108,11 +116,13 @@ rollout:
 
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
+  recompute_logprobs: False
   enable_offload: True
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/piper-vla"  # TODO: piper policy that emits 14-dim actions
+    # huggingface.co/Shirk6/pi05-piper-insert-mouse-battery-run2-30000-pytorch
+    model_path: "/mnt/afs-h200/yuyangcheng/data/pi05-piper-insert-mouse-battery-30000"
     precision: ${actor.model.precision}
 
 actor:
@@ -124,22 +134,36 @@ actor:
   enable_offload: True
 
   model:
-    model_path: "/path/to/piper-vla"  # TODO: piper policy
-    model_type: "openvla_oft"
-    max_prompt_length: 128
+    model_path: "/mnt/afs-h200/yuyangcheng/data/pi05-piper-insert-mouse-battery-30000"
+    model_type: "openpi"
+    # Piper world model emits dual-arm joint deltas. Env consumes [N, 12, 14].
+    # The SFT'd pi0.5 was trained with horizon=50 / internal action_dim=32
+    # (config.json on the HF repo); openpi will be called with chunk=12 (env
+    # match) and the policy's 32-dim output is sliced to action_env_dim=14
+    # (piper's first 14 dims; remaining 18 dims are padding zeros).
+    num_action_chunks: 12
+    action_dim: 14
+    add_value_head: False   # GRPO does not use a critic head
+    openpi:
+      config_name: "pi05_piper"   # TODO: add matching dataconfig under rlinf/models/embodiment/openpi/dataconfig/
+      num_images_in_input: 1      # DreamDojo env returns one main image, no wrist
+      noise_level: 0.5
+      action_chunk: ${..num_action_chunks}
+      action_env_dim: ${..action_dim}
 
   optim:
-    lr: 2.0e-5
-    value_lr: 3.0e-3
+    lr: 5.0e-6
+    value_lr: 1.0e-4
     adam_beta1: 0.9
-    adam_beta2: 0.999
-    adam_eps: 1.0e-05
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
     weight_decay: 0.01
     clip_grad: 1.0
 
   fsdp_config:
     strategy: "fsdp"
-    gradient_checkpointing: True
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False  # openpi does NOT support gradient checkpointing
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

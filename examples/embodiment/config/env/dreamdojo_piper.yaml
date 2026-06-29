@@ -33,7 +33,10 @@ enable_offload: False
 dreamdojo_repo_path: /mnt/afs-h200/yuyangcheng/data/Shirk6_DreamDojo_piper
 
 # Cosmos checkpoint dir + experiment registration.
-dreamdojo_ckpt_path: /mnt/afs-h200/yuyangcheng/data/Shirk6_DreamDojo_piper/dreamdojo_logs/dreamdojo/exp1201/piper_vertical_1440_640_fps10/checkpoints/iter_000010000/model
+# distcp format (sharded DCP) -- Cosmos Video2WorldInference loads the `model/`
+# directory and re-assembles the shards. iter30000 was downloaded from
+# huggingface.co/Shirk6/dreamdojo-piper-vertical-1440-640-fps10-iter30000.
+dreamdojo_ckpt_path: /mnt/afs-h200/yuyangcheng/data/DreamDojo-ckpt/dreamdojo-piper-iter30000/model
 experiment: dreamdojo_2b_1440_640_piper
 config_file: cosmos_predict2/_src/predict2/action/configs/action_conditioned/config.py
 

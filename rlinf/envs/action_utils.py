@@ -81,16 +81,38 @@ def prepare_actions_for_libero(
 
 def prepare_actions_for_piper(
     raw_chunk_actions,
+    policy_chunk: int = 36,
+    env_chunk: int = 12,
+    stride: int = 3,
 ) -> np.ndarray:
     """Prepare policy actions for the DreamDojo piper world model.
 
-    The piper model consumes a 14-dim dual-arm joint-position delta per frame
-    (placed into slots [169:183] of the 384-wide cosmos action vector by the
-    env). The policy is expected to already emit this 14-dim action, so this is
-    a pass-through that only guarantees a float32 numpy array. Add scaling /
-    convention conversion here if the policy's action space differs.
+    FPS-domain shift: pi0.5 was SFT'd at 30 fps (action_horizon=50), while
+    the DreamDojo piper world model was trained at 10 fps (chunk=12). We
+    take the first ``policy_chunk`` (36) actions out of pi0.5's output and
+    downsample by ``stride`` (3) to get ``env_chunk`` (12) actions for the
+    world model. Net effect: RL only optimizes the first 36 / 50 action
+    slots emitted by pi0.5; the remaining 14 are unused.
+
+    Action dim is 14 (piper dual-arm joint position, 6+1+6+1). The env's
+    ``_build_model_action`` scatters this into slots [169:183] of the
+    384-wide cosmos action vector.
     """
-    return np.asarray(raw_chunk_actions, dtype=np.float32)
+    actions = np.asarray(raw_chunk_actions, dtype=np.float32)
+    if actions.shape[-2] < policy_chunk:
+        raise ValueError(
+            f"Expected at least {policy_chunk} action chunks from policy, "
+            f"got shape {actions.shape}. Set actor.model.num_action_chunks "
+            f">= {policy_chunk}."
+        )
+    actions = actions[..., :policy_chunk, :][..., ::stride, :]
+    if actions.shape[-2] != env_chunk:
+        raise ValueError(
+            f"Downsampling produced {actions.shape[-2]} actions, expected "
+            f"{env_chunk}. Check policy_chunk / stride: "
+            f"{policy_chunk} // {stride} != {env_chunk}."
+        )
+    return actions
 
 
 def prepare_actions_for_isaaclab(

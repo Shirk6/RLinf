@@ -136,16 +136,19 @@ actor:
   model:
     model_path: "/mnt/afs-h200/yuyangcheng/data/pi05-piper-insert-mouse-battery-30000"
     model_type: "openpi"
-    # Piper world model emits dual-arm joint deltas. Env consumes [N, 12, 14].
-    # The SFT'd pi0.5 was trained with horizon=50 / internal action_dim=32
-    # (config.json on the HF repo); openpi will be called with chunk=12 (env
-    # match) and the policy's 32-dim output is sliced to action_env_dim=14
-    # (piper's first 14 dims; remaining 18 dims are padding zeros).
-    num_action_chunks: 12
+    # FPS-domain shift: pi0.5 was SFT'd at 30 fps with action_horizon=50 (=
+    # 1.67 s of motion). The DreamDojo world model was trained at 10 fps with
+    # chunk=12 (= 1.2 s). To bridge these:
+    #   pi0.5 outputs 36 actions per inference (RL optimizes only these 36
+    #   out of the SFT'd 50; the trailing 14 slots are unused);
+    #   action_utils.prepare_actions_for_piper takes a stride of 3 to
+    #   downsample [:, :36] -> [:, :12] before feeding the env.
+    # Both numbers below must match action_utils.prepare_actions_for_piper.
+    num_action_chunks: 36
     action_dim: 14
     add_value_head: False   # GRPO does not use a critic head
     openpi:
-      config_name: "pi05_piper"   # TODO: add matching dataconfig under rlinf/models/embodiment/openpi/dataconfig/
+      config_name: "pi05_piper"   # registered in rlinf/models/embodiment/openpi/dataconfig/__init__.py
       num_images_in_input: 1      # DreamDojo env returns one main image, no wrist
       noise_level: 0.5
       action_chunk: ${..num_action_chunks}
